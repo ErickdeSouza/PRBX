@@ -386,6 +386,25 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
         "Sequência DT_FINI_ARRAY/DT_FINI em ordem de descarregamento (planejada, não executada): {}",
         fini_sequences.join(" -> ")
     ));
+    for index in 0..mapped_images.len() {
+        let file_name = mapped_images[index].0.clone();
+        let library = target_libraries[index];
+        let elf = library
+            .elf
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{}: {error}", library.path))?;
+        let plan = elf
+            .load_plan
+            .as_ref()
+            .with_context(|| format!("{} não tem plano de imagem ELF", library.path))?;
+        let protected_ranges = mapped_images[index]
+            .1
+            .apply_final_page_protections_without_execute(plan, &elf.relro_plans)
+            .with_context(|| format!("falha ao proteger memória ELF de {file_name}"))?;
+        image_checks.push(format!(
+            "{file_name}: permissões finais aplicadas em {protected_ranges} intervalos; execução desativada"
+        ));
+    }
 
     write_image_check_report(&staged_install.join(&image_report), &image_checks)?;
     fs::create_dir_all(app_root.join("data"))?;
@@ -720,7 +739,8 @@ fn write_load_plan_report(path: &Path, libraries: &[&crate::apk::NativeLibrary])
 fn write_image_check_report(path: &Path, checks: &[String]) -> Result<()> {
     let mut report = String::from(
         "Imagens mapeadas em memória virtual RW durante prepare; relocations relativas e símbolos entre bibliotecas do APK tentados.\n\
-Mapeamentos são descartados ao terminar prepare, páginas não executáveis, símbolos Android não fornecidos continuam pendentes.\n",
+Após relocations, permissões por página e RELRO são aplicadas, sempre sem permissão de execução; imagens são descartadas ao terminar prepare.\n\
+Símbolos Android não fornecidos continuam pendentes; nenhuma rotina do APK é chamada.\n",
     );
     for check in checks {
         report.push_str(check);

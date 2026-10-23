@@ -114,6 +114,7 @@ pub struct MappedElfImage {
     pub symbol_relocations_applied: usize,
     pub unresolved_relocation_count: usize,
     pub unresolved_relocations: Vec<String>,
+    page_protections_applied: bool,
 }
 
 pub struct ElfReport {
@@ -911,6 +912,7 @@ pub fn map_load_image(
         symbol_relocations_applied: 0,
         unresolved_relocation_count: 0,
         unresolved_relocations: Vec::new(),
+        page_protections_applied: false,
     })
 }
 
@@ -923,8 +925,55 @@ impl MappedElfImage {
         self.mapping.len()
     }
 
-    pub fn bytes(&self) -> &[u8] {
-        &self.mapping
+    pub fn bytes(&self) -> Result<&[u8]> {
+        if self.page_protections_applied {
+            anyhow::bail!("não é possível inspecionar bytes após proteger a imagem ELF");
+        }
+        Ok(&self.mapping)
+    }
+
+    pub fn apply_final_page_protections_without_execute(
+        &mut self,
+        plan: &ElfLoadPlan,
+        relro_plans: &[ElfRelroPlan],
+    ) -> Result<usize> {
+        if self.page_protections_applied {
+            anyhow::bail!("proteções finais da imagem ELF já foram aplicadas");
+        }
+        let protections = plan.post_relro_page_protection_plan(relro_plans)?;
+        if plan.image_size != self.mapping.len() as u64 {
+            anyhow::bail!("tamanho da imagem mapeada difere do plano de proteções");
+        }
+        self.page_protections_applied = true;
+        for protection in &protections {
+            let offset = usize::try_from(
+                protection
+                    .start
+                    .checked_sub(plan.image_start)
+                    .context("página protegida antecede a imagem ELF")?,
+            )
+            .context("offset de proteção não cabe em usize")?;
+            let length = usize::try_from(
+                protection
+                    .end
+                    .checked_sub(protection.start)
+                    .context("intervalo de proteção inválido")?,
+            )
+            .context("tamanho da proteção não cabe em usize")?;
+            let end = offset
+                .checked_add(length)
+                .context("overflow no intervalo de proteção ELF")?;
+            if end > self.mapping.len() {
+                anyhow::bail!("intervalo de proteção excede a imagem mapeada");
+            }
+            protect_memory(
+                unsafe { self.mapping.as_ptr().add(offset) as *mut u8 },
+                length,
+                protection.readable,
+                protection.writable,
+            )?;
+        }
+        Ok(protections.len())
     }
 
     pub fn resolve_init_functions(
@@ -932,6 +981,9 @@ impl MappedElfImage {
         load_plan: &ElfLoadPlan,
         init_plan: &ElfInitPlan,
     ) -> Result<ResolvedElfInitPlan> {
+        if self.page_protections_applied {
+            anyhow::bail!("não é possível inspecionar inicializadores após proteger a imagem ELF");
+        }
         fn resolve_address(address: u64, load_bias: u64, load_plan: &ElfLoadPlan) -> Result<u64> {
             let runtime_address = load_bias
                 .checked_add(address)
@@ -1013,6 +1065,9 @@ impl MappedElfImage {
         relocations: &[ElfRelocation],
         packaged_symbols: &BTreeMap<String, u64>,
     ) -> Result<()> {
+        if self.page_protections_applied {
+            anyhow::bail!("não é possível aplicar relocations após as proteções finais");
+        }
         let mut writes = Vec::new();
         let mut unresolved = BTreeSet::new();
         let mut relative_count = 0;
@@ -1026,6 +1081,7 @@ impl MappedElfImage {
                     if relocation.symbol_index != 0 {
                         anyhow::bail!("R_AARCH64_RELATIVE deve usar índice de símbolo zero");
                     }
+
                     let addend = match relocation.addend {
                         Some(addend) => i128::from(addend),
                         None if relocation.relocation_name == "R_AARCH64_RELATIVE_RELR" => {
@@ -1181,6 +1237,74 @@ impl MappedElfImage {
         self.unresolved_relocations = unresolved.into_iter().collect();
         Ok(())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn protect_memory(address: *mut u8, length: usize, readable: bool, writable: bool) -> Result<()> {
+    use std::ffi::c_void;
+
+    const PROT_NONE: i32 = 0;
+    const PROT_READ: i32 = 1;
+    const PROT_WRITE: i32 = 2;
+
+    unsafe extern "C" {
+        fn mprotect(address: *mut c_void, length: usize, protection: i32) -> i32;
+    }
+
+    let mut protection = PROT_NONE;
+    if readable {
+        protection |= PROT_READ;
+    }
+    if writable {
+        protection |= PROT_WRITE;
+    }
+    let result = unsafe { mprotect(address.cast(), length, protection) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("mprotect falhou ao aplicar proteções ELF");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn protect_memory(address: *mut u8, length: usize, readable: bool, writable: bool) -> Result<()> {
+    use std::ffi::c_void;
+
+    const PAGE_NOACCESS: u32 = 0x01;
+    const PAGE_READONLY: u32 = 0x02;
+    const PAGE_READWRITE: u32 = 0x04;
+
+    unsafe extern "system" {
+        fn VirtualProtect(
+            address: *mut c_void,
+            size: usize,
+            new_protect: u32,
+            old_protect: *mut u32,
+        ) -> i32;
+    }
+
+    let protection = match (readable, writable) {
+        (false, _) => PAGE_NOACCESS,
+        (true, true) => PAGE_READWRITE,
+        (true, false) => PAGE_READONLY,
+    };
+    let mut old_protection = 0;
+    let result = unsafe { VirtualProtect(address.cast(), length, protection, &mut old_protection) };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("VirtualProtect falhou ao aplicar proteções ELF");
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn protect_memory(
+    _address: *mut u8,
+    _length: usize,
+    _readable: bool,
+    _writable: bool,
+) -> Result<()> {
+    anyhow::bail!("aplicação de proteções ELF não é suportada nesta plataforma")
 }
 
 pub fn symbol_lookup_key(name: &str, version: Option<&ElfSymbolVersion>) -> String {
@@ -1976,18 +2100,75 @@ mod tests {
             .unwrap();
 
         assert_eq!(image.image_size(), 0x1000);
-        assert!(image.bytes()[..0x100].iter().all(|byte| *byte == 0));
-        assert!(image.bytes()[0x100..0x110].iter().all(|byte| *byte == 0xab));
+        assert!(
+            image.bytes().unwrap()[..0x100]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        assert!(
+            image.bytes().unwrap()[0x100..0x110]
+                .iter()
+                .all(|byte| *byte == 0xab)
+        );
         assert_eq!(
-            u64::from_le_bytes(image.bytes()[0x110..0x118].try_into().unwrap()),
+            u64::from_le_bytes(image.bytes().unwrap()[0x110..0x118].try_into().unwrap()),
             load_bias + 0x30
         );
-        assert!(image.bytes()[0x118..0x120].iter().all(|byte| *byte == 0xab));
-        assert!(image.bytes()[0x120..].iter().all(|byte| *byte == 0));
+        assert!(
+            image.bytes().unwrap()[0x118..0x120]
+                .iter()
+                .all(|byte| *byte == 0xab)
+        );
+        assert!(
+            image.bytes().unwrap()[0x120..]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
         assert_eq!(image.relative_relocations_applied, 1);
         assert_eq!(
             image.unresolved_relocations,
             vec!["external_symbol".to_owned()]
+        );
+    }
+
+    #[test]
+    fn applies_read_only_non_executable_memory_protections() {
+        let file_bytes = vec![0x5a; ELF_PAGE_SIZE as usize];
+        let plan = ElfLoadPlan {
+            page_size: ELF_PAGE_SIZE,
+            image_start: 0x1000,
+            image_end: 0x2000,
+            image_size: ELF_PAGE_SIZE,
+            segments: vec![ElfLoadSegment {
+                file_offset: 0,
+                virtual_address: 0x1000,
+                file_size: ELF_PAGE_SIZE,
+                memory_size: ELF_PAGE_SIZE,
+                alignment: ELF_PAGE_SIZE,
+                mapped_start: 0x1000,
+                mapped_end: 0x2000,
+                readable: true,
+                writable: false,
+                executable: true,
+            }],
+        };
+        let mut image = map_load_image(&file_bytes, &plan, ELF_PAGE_SIZE).unwrap();
+        assert_eq!(
+            image
+                .apply_final_page_protections_without_execute(&plan, &[])
+                .unwrap(),
+            1
+        );
+        assert!(image.bytes().is_err());
+        assert!(
+            image
+                .apply_final_page_protections_without_execute(&plan, &[])
+                .is_err()
+        );
+        assert!(
+            image
+                .apply_relocations(&plan, &[], &BTreeMap::new())
+                .is_err()
         );
     }
 
@@ -2035,7 +2216,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            u64::from_le_bytes(image.bytes()[0x10..0x18].try_into().unwrap()),
+            u64::from_le_bytes(image.bytes().unwrap()[0x10..0x18].try_into().unwrap()),
             load_bias + 0x1234
         );
         assert_eq!(image.relative_relocations_applied, 1);
@@ -2202,7 +2383,11 @@ mod tests {
 
         for (offset, expected) in [(0x10, 0x1119), (0x18, 0x2222), (0x20, 0x3333)] {
             assert_eq!(
-                u64::from_le_bytes(image.bytes()[offset..offset + 8].try_into().unwrap()),
+                u64::from_le_bytes(
+                    image.bytes().unwrap()[offset..offset + 8]
+                        .try_into()
+                        .unwrap()
+                ),
                 expected
             );
         }
@@ -2256,7 +2441,7 @@ mod tests {
             .apply_relocations(&plan, &[relocation.clone()], &symbols)
             .unwrap();
         assert_eq!(
-            u64::from_le_bytes(image.bytes()[8..16].try_into().unwrap()),
+            u64::from_le_bytes(image.bytes().unwrap()[8..16].try_into().unwrap()),
             0x5678
         );
 
@@ -2385,23 +2570,23 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            u16::from_le_bytes(image.bytes()[0x10..0x12].try_into().unwrap()),
+            u16::from_le_bytes(image.bytes().unwrap()[0x10..0x12].try_into().unwrap()),
             0x1234
         );
         assert_eq!(
-            u32::from_le_bytes(image.bytes()[0x12..0x16].try_into().unwrap()),
+            u32::from_le_bytes(image.bytes().unwrap()[0x12..0x16].try_into().unwrap()),
             0x1234_5678
         );
         assert_eq!(
-            i16::from_le_bytes(image.bytes()[0x16..0x18].try_into().unwrap()),
+            i16::from_le_bytes(image.bytes().unwrap()[0x16..0x18].try_into().unwrap()),
             0xea
         );
         assert_eq!(
-            i32::from_le_bytes(image.bytes()[0x18..0x1c].try_into().unwrap()),
+            i32::from_le_bytes(image.bytes().unwrap()[0x18..0x1c].try_into().unwrap()),
             -0x118
         );
         assert_eq!(
-            i64::from_le_bytes(image.bytes()[0x1c..0x24].try_into().unwrap()),
+            i64::from_le_bytes(image.bytes().unwrap()[0x1c..0x24].try_into().unwrap()),
             -0x1c
         );
         assert_eq!(image.symbol_relocations_applied, 5);
@@ -2449,7 +2634,7 @@ mod tests {
             ..valid.clone()
         };
         let mut image = map_load_image(&[0xab; 0x40], &plan, ELF_PAGE_SIZE).unwrap();
-        let before = image.bytes().to_vec();
+        let before = image.bytes().unwrap().to_vec();
         let far_symbol = image.load_bias + 0x1_0000;
 
         assert!(
@@ -2464,7 +2649,7 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_eq!(image.bytes(), before);
+        assert_eq!(image.bytes().unwrap(), before);
         assert_eq!(image.symbol_relocations_applied, 0);
     }
 
@@ -2515,7 +2700,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            u64::from_le_bytes(image.bytes()[8..16].try_into().unwrap()),
+            u64::from_le_bytes(image.bytes().unwrap()[8..16].try_into().unwrap()),
             0
         );
         assert_eq!(image.symbol_relocations_applied, 1);
