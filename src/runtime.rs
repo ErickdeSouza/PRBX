@@ -46,6 +46,7 @@ pub struct PreparedApp {
     pub shared_storage: PathBuf,
     pub dependency_report: PathBuf,
     pub symbol_report: PathBuf,
+    pub load_plan_report: PathBuf,
     pub packaged_dependencies: usize,
     pub android_dependencies: usize,
     pub unknown_dependencies: usize,
@@ -155,6 +156,7 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
     let dependency_report = format!("native-dependencies-{TARGET_ABI}.txt");
     let symbols = native_symbols(&target_libraries)?;
     let symbol_report = format!("native-symbols-{TARGET_ABI}.txt");
+    let load_plan_report = format!("native-load-plan-{TARGET_ABI}.txt");
     let launch_config_file = "launch-config.json";
     let packaged_dependencies = dependencies
         .iter()
@@ -193,6 +195,7 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
     })?;
     write_dependency_report(&staged_install.join(&dependency_report), &dependencies)?;
     write_symbol_report(&staged_install.join(&symbol_report), &symbols)?;
+    write_load_plan_report(&staged_install.join(&load_plan_report), &target_libraries)?;
     write_launch_config(&staged_install.join(launch_config_file), &launch_config)?;
 
     let file = File::open(apk_path)
@@ -281,6 +284,7 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
         shared_storage,
         dependency_report: install_dir.join(&dependency_report),
         symbol_report: install_dir.join(&symbol_report),
+        load_plan_report: install_dir.join(&load_plan_report),
         packaged_dependencies,
         android_dependencies,
         unknown_dependencies,
@@ -405,6 +409,57 @@ Eles são requisitos de resolução ELF; não indicam por si só chamadas execut
         }
         writeln!(report, "{} | {}", symbol.group, symbol.symbol)
             .expect("escrever em String não falha");
+    }
+    fs::write(path, report)
+        .with_context(|| format!("não foi possível gravar o relatório {}", path.display()))
+}
+
+fn write_load_plan_report(path: &Path, libraries: &[&crate::apk::NativeLibrary]) -> Result<()> {
+    use std::fmt::Write as _;
+
+    let mut report = String::from(
+        "Plano estrutural de mapeamento ELF por páginas; não reserva memória, aplica relocations nem executa código.\n",
+    );
+    for library in libraries {
+        let name = Path::new(&library.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .with_context(|| format!("caminho de biblioteca inválido: {}", library.path))?;
+        let elf = library
+            .elf
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{}: {error}", library.path))?;
+        let plan = elf
+            .load_plan
+            .as_ref()
+            .with_context(|| format!("{} não contém segmentos PT_LOAD", library.path))?;
+        writeln!(
+            report,
+            "\n[{name}] imagem 0x{:x}..0x{:x} ({} bytes; página {})",
+            plan.image_start, plan.image_end, plan.image_size, plan.page_size
+        )
+        .expect("escrever em String não falha");
+        for (index, segment) in plan.segments.iter().enumerate() {
+            let permissions = format!(
+                "{}{}{}",
+                if segment.readable { 'r' } else { '-' },
+                if segment.writable { 'w' } else { '-' },
+                if segment.executable { 'x' } else { '-' }
+            );
+            writeln!(
+                report,
+                "PT_LOAD {index}: vaddr=0x{:x} map=0x{:x}..0x{:x} file=0x{:x}+0x{:x} mem=0x{:x} bss=0x{:x} align=0x{:x} flags={permissions}",
+                segment.virtual_address,
+                segment.mapped_start,
+                segment.mapped_end,
+                segment.file_offset,
+                segment.file_size,
+                segment.memory_size,
+                segment.memory_size - segment.file_size,
+                segment.alignment
+            )
+            .expect("escrever em String não falha");
+        }
     }
     fs::write(path, report)
         .with_context(|| format!("não foi possível gravar o relatório {}", path.display()))
@@ -804,6 +859,13 @@ mod tests {
                 abi_matches: true,
                 has_load_segment: true,
                 has_dynamic_segment: true,
+                load_plan: Some(crate::elf::ElfLoadPlan {
+                    page_size: 4096,
+                    image_start: 0,
+                    image_end: 4096,
+                    image_size: 4096,
+                    segments: Vec::new(),
+                }),
                 needed: needed.iter().map(|name| (*name).to_owned()).collect(),
                 imports: Vec::new(),
                 exports: Vec::new(),

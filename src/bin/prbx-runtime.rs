@@ -71,6 +71,10 @@ fn run() -> Result<()> {
         prepared.symbol_report.display()
     );
     println!(
+        "Plano de mapeamento ELF: {}",
+        prepared.load_plan_report.display()
+    );
+    println!(
         "Dependências ELF: {} no APK, {} de plataforma Android, {} não classificadas",
         prepared.packaged_dependencies,
         prepared.android_dependencies,

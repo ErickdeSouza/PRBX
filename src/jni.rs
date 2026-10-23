@@ -286,6 +286,13 @@ mod tests {
                 abi_matches: true,
                 has_load_segment: true,
                 has_dynamic_segment: true,
+                load_plan: Some(crate::elf::ElfLoadPlan {
+                    page_size: 4096,
+                    image_start: 0,
+                    image_end: 4096,
+                    image_size: 4096,
+                    segments: Vec::new(),
+                }),
                 needed: Vec::new(),
                 imports: Vec::new(),
                 exports: exports.iter().map(|name| (*name).to_owned()).collect(),

@@ -2,6 +2,31 @@ use anyhow::{Context, Result};
 use goblin::elf::{Elf, header, program_header};
 use std::collections::BTreeMap;
 
+const ELF_PAGE_SIZE: u64 = 4096;
+
+#[derive(Clone, Debug)]
+pub struct ElfLoadSegment {
+    pub file_offset: u64,
+    pub virtual_address: u64,
+    pub file_size: u64,
+    pub memory_size: u64,
+    pub alignment: u64,
+    pub mapped_start: u64,
+    pub mapped_end: u64,
+    pub readable: bool,
+    pub writable: bool,
+    pub executable: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ElfLoadPlan {
+    pub page_size: u64,
+    pub image_start: u64,
+    pub image_end: u64,
+    pub image_size: u64,
+    pub segments: Vec<ElfLoadSegment>,
+}
+
 pub struct ElfReport {
     pub class: &'static str,
     pub machine: &'static str,
@@ -10,6 +35,7 @@ pub struct ElfReport {
     pub abi_matches: bool,
     pub has_load_segment: bool,
     pub has_dynamic_segment: bool,
+    pub load_plan: Option<ElfLoadPlan>,
     pub needed: Vec<String>,
     pub imports: Vec<String>,
     pub exports: Vec<String>,
@@ -25,6 +51,7 @@ impl ElfReport {
             && self.abi_matches
             && self.has_load_segment
             && self.has_dynamic_segment
+            && self.load_plan.is_some()
     }
 }
 
@@ -46,6 +73,26 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
         .program_headers
         .iter()
         .any(|segment| segment.p_type == program_header::PT_DYNAMIC);
+    let load_segments = elf
+        .program_headers
+        .iter()
+        .filter(|segment| segment.p_type == program_header::PT_LOAD)
+        .map(|segment| {
+            (
+                segment.p_offset,
+                segment.p_vaddr,
+                segment.p_filesz,
+                segment.p_memsz,
+                segment.p_align,
+                segment.p_flags,
+            )
+        })
+        .collect::<Vec<_>>();
+    let load_plan = if load_segments.is_empty() {
+        None
+    } else {
+        Some(build_load_plan(bytes.len() as u64, &load_segments)?)
+    };
     let mut imports = Vec::new();
     let mut exports = Vec::new();
 
@@ -78,6 +125,7 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
         abi_matches: abi_matches_machine(abi, elf.header.e_machine),
         has_load_segment,
         has_dynamic_segment,
+        load_plan,
         needed: elf
             .libraries
             .iter()
@@ -87,6 +135,83 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
         exports,
         android_api_imports,
     })
+}
+
+fn build_load_plan(
+    file_size: u64,
+    segments: &[(u64, u64, u64, u64, u64, u32)],
+) -> Result<ElfLoadPlan> {
+    let mut planned_segments = Vec::with_capacity(segments.len());
+    for &(file_offset, virtual_address, segment_file_size, memory_size, alignment, flags) in
+        segments
+    {
+        if segment_file_size > memory_size {
+            anyhow::bail!("segmento PT_LOAD tem p_filesz maior que p_memsz");
+        }
+        let file_end = file_offset
+            .checked_add(segment_file_size)
+            .context("overflow no intervalo de arquivo do segmento PT_LOAD")?;
+        if file_end > file_size {
+            anyhow::bail!("segmento PT_LOAD excede o tamanho do ELF");
+        }
+        if file_offset % ELF_PAGE_SIZE != virtual_address % ELF_PAGE_SIZE {
+            anyhow::bail!(
+                "offset e endereço virtual não são compatíveis com mapeamento por página"
+            );
+        }
+        if alignment > 1
+            && (!alignment.is_power_of_two()
+                || file_offset % alignment != virtual_address % alignment)
+        {
+            anyhow::bail!("alinhamento inválido no segmento PT_LOAD");
+        }
+        let virtual_end = virtual_address
+            .checked_add(memory_size)
+            .context("overflow no intervalo virtual do segmento PT_LOAD")?;
+        let mapped_start = virtual_address & !(ELF_PAGE_SIZE - 1);
+        let mapped_end = align_up(virtual_end, ELF_PAGE_SIZE)?;
+        planned_segments.push(ElfLoadSegment {
+            file_offset,
+            virtual_address,
+            file_size: segment_file_size,
+            memory_size,
+            alignment,
+            mapped_start,
+            mapped_end,
+            readable: flags & program_header::PF_R != 0,
+            writable: flags & program_header::PF_W != 0,
+            executable: flags & program_header::PF_X != 0,
+        });
+    }
+
+    let image_start = planned_segments
+        .iter()
+        .map(|segment| segment.mapped_start)
+        .min()
+        .context("ELF não contém segmentos PT_LOAD")?;
+    let image_end = planned_segments
+        .iter()
+        .map(|segment| segment.mapped_end)
+        .max()
+        .context("ELF não contém segmentos PT_LOAD")?;
+    let image_size = image_end
+        .checked_sub(image_start)
+        .context("intervalo virtual ELF inválido")?;
+
+    Ok(ElfLoadPlan {
+        page_size: ELF_PAGE_SIZE,
+        image_start,
+        image_end,
+        image_size,
+        segments: planned_segments,
+    })
+}
+
+fn align_up(value: u64, alignment: u64) -> Result<u64> {
+    value
+        .checked_add(alignment - 1)
+        .map(|aligned| aligned & !(alignment - 1))
+        .context("overflow ao alinhar o intervalo virtual ELF")
 }
 
 fn android_api_group(symbol: &str) -> Option<&'static str> {
@@ -185,6 +310,13 @@ mod tests {
             abi_matches: true,
             has_load_segment: true,
             has_dynamic_segment: true,
+            load_plan: Some(ElfLoadPlan {
+                page_size: ELF_PAGE_SIZE,
+                image_start: 0,
+                image_end: ELF_PAGE_SIZE,
+                image_size: ELF_PAGE_SIZE,
+                segments: Vec::new(),
+            }),
             needed: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
@@ -197,6 +329,57 @@ mod tests {
             ..report
         };
         assert!(!incompatible.is_loadable_android_arm64_shared_object());
+    }
+
+    #[test]
+    fn creates_page_aligned_load_plan_and_tracks_segment_permissions() {
+        let plan = build_load_plan(
+            0x5000,
+            &[
+                (0x1000, 0x1000, 0x800, 0x1000, 0x1000, program_header::PF_R),
+                (
+                    0x3000,
+                    0x3000,
+                    0x1000,
+                    0x1800,
+                    0x1000,
+                    program_header::PF_R | program_header::PF_W | program_header::PF_X,
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(plan.page_size, 4096);
+        assert_eq!(plan.image_start, 0x1000);
+        assert_eq!(plan.image_end, 0x5000);
+        assert_eq!(plan.image_size, 0x4000);
+        assert_eq!(plan.segments.len(), 2);
+        assert!(plan.segments[0].readable);
+        assert!(!plan.segments[0].writable);
+        assert!(plan.segments[1].writable && plan.segments[1].executable);
+        assert_eq!(
+            plan.segments[1].memory_size - plan.segments[1].file_size,
+            0x800
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_load_segment_ranges_and_alignment() {
+        assert!(build_load_plan(0x1000, &[(0, 0, 0x800, 0x400, 1, program_header::PF_R)]).is_err());
+        assert!(
+            build_load_plan(0x1000, &[(0x800, 0, 0x900, 0x900, 1, program_header::PF_R)]).is_err()
+        );
+        assert!(
+            build_load_plan(
+                0x1000,
+                &[(0x1000, 0, 0x100, 0x100, 3, program_header::PF_R)]
+            )
+            .is_err()
+        );
+        assert!(
+            build_load_plan(0x1000, &[(0x100, 0, 0x100, 0x100, 1, program_header::PF_R)]).is_err()
+        );
+        assert!(build_load_plan(0x1000, &[]).is_err());
     }
 
     #[test]
