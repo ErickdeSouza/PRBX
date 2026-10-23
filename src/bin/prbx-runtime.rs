@@ -47,6 +47,15 @@ fn run() -> Result<()> {
     println!("APK preparado para: {}", prepared.package);
     println!("Diretório isolado: {}", prepared.app_root.display());
     println!("APK armazenado em: {}", prepared.apk_path.display());
+    println!(
+        "Configuração de inicialização: {}",
+        prepared.launch_config.display()
+    );
+    if let Some(library) = &prepared.native_entry_library {
+        println!("Biblioteca de entrada declarada: {library}");
+    } else {
+        println!("Biblioteca de entrada declarada: nenhuma");
+    }
     println!("Bibliotecas ARM64 extraídas: {}", prepared.native_libraries);
     println!(
         "Assets extraídos: {} arquivos ({} bytes)",

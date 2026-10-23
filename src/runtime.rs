@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use zip::ZipArchive;
 
 use crate::apk;
@@ -49,6 +50,26 @@ pub struct PreparedApp {
     pub android_dependencies: usize,
     pub unknown_dependencies: usize,
     pub imported_symbols: usize,
+    pub launch_config: PathBuf,
+    pub native_entry_library: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct AppLaunchConfig {
+    pub schema_version: u32,
+    pub package: String,
+    pub abi: String,
+    pub application_class: Option<String>,
+    pub launcher_activity: Option<String>,
+    pub min_sdk: Option<String>,
+    pub target_sdk: Option<String>,
+    pub native_library: Option<String>,
+    pub apk_path: String,
+    pub assets_path: String,
+    pub private_data_path: String,
+    pub cache_path: String,
+    pub files_path: String,
+    pub shared_storage_path: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -129,10 +150,12 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
             );
         }
     }
+    let launch_config = build_launch_config(manifest, &target_libraries)?;
     let dependencies = native_dependencies(&target_libraries)?;
     let dependency_report = format!("native-dependencies-{TARGET_ABI}.txt");
     let symbols = native_symbols(&target_libraries)?;
     let symbol_report = format!("native-symbols-{TARGET_ABI}.txt");
+    let launch_config_file = "launch-config.json";
     let packaged_dependencies = dependencies
         .iter()
         .filter(|dependency| dependency.kind == DependencyKind::Packaged)
@@ -170,6 +193,7 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
     })?;
     write_dependency_report(&staged_install.join(&dependency_report), &dependencies)?;
     write_symbol_report(&staged_install.join(&symbol_report), &symbols)?;
+    write_launch_config(&staged_install.join(launch_config_file), &launch_config)?;
 
     let file = File::open(apk_path)
         .with_context(|| format!("não foi possível abrir {}", apk_path.display()))?;
@@ -261,7 +285,80 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
         android_dependencies,
         unknown_dependencies,
         imported_symbols: symbols.len(),
+        launch_config: install_dir.join(launch_config_file),
+        native_entry_library: launch_config.native_library.clone(),
     })
+}
+
+fn build_launch_config(
+    manifest: &crate::analysis::manifest::ManifestReport,
+    libraries: &[&crate::apk::NativeLibrary],
+) -> Result<AppLaunchConfig> {
+    let package = manifest
+        .package
+        .as_deref()
+        .context("o manifesto não informa o nome do pacote")?;
+    validate_package_name(package)?;
+    let native_library = manifest
+        .metadata
+        .iter()
+        .find(|(name, _)| name == "android.app.lib_name")
+        .map(|(_, value)| native_library_path(value))
+        .transpose()?;
+    if let Some(expected_path) = &native_library
+        && !libraries.iter().any(|library| {
+            Path::new(&library.path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Path::new(expected_path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+        })
+    {
+        bail!(
+            "a biblioteca de entrada declarada no manifesto ({expected_path}) não foi encontrada para a ABI {TARGET_ABI}"
+        );
+    }
+
+    Ok(AppLaunchConfig {
+        schema_version: 1,
+        package: package.to_owned(),
+        abi: TARGET_ABI.to_owned(),
+        application_class: manifest.application_class.clone(),
+        launcher_activity: manifest.launcher_activity.clone(),
+        min_sdk: manifest.min_sdk.clone(),
+        target_sdk: manifest.target_sdk.clone(),
+        native_library,
+        apk_path: "apk/base.apk".to_owned(),
+        assets_path: "assets".to_owned(),
+        private_data_path: "../data".to_owned(),
+        cache_path: "../cache".to_owned(),
+        files_path: "../files".to_owned(),
+        shared_storage_path: "../storage".to_owned(),
+    })
+}
+
+fn native_library_path(value: &str) -> Result<String> {
+    let name = value
+        .strip_prefix("lib")
+        .and_then(|name| name.strip_suffix(".so"))
+        .unwrap_or(value);
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        bail!("android.app.lib_name contém nome de biblioteca inválido: {value}");
+    }
+    Ok(format!("native/{TARGET_ABI}/lib{name}.so"))
+}
+
+fn write_launch_config(path: &Path, config: &AppLaunchConfig) -> Result<()> {
+    let mut bytes =
+        serde_json::to_vec_pretty(config).context("falha ao serializar configuração")?;
+    bytes.push(b'\n');
+    fs::write(path, bytes)
+        .with_context(|| format!("não foi possível gravar configuração {}", path.display()))
 }
 
 fn native_symbols(libraries: &[&crate::apk::NativeLibrary]) -> Result<Vec<NativeSymbol>> {
@@ -689,6 +786,7 @@ fn validate_package_name(package: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::manifest::ManifestReport;
     use crate::elf::ElfReport;
     use std::collections::BTreeMap;
 
@@ -707,6 +805,18 @@ mod tests {
                 exports: Vec::new(),
                 android_api_imports: BTreeMap::new(),
             }),
+        }
+    }
+
+    fn manifest_with_library(name: &str, value: &str) -> ManifestReport {
+        ManifestReport {
+            package: Some("com.example".to_owned()),
+            application_class: Some("com.example.App".to_owned()),
+            launcher_activity: Some("com.example.MainActivity".to_owned()),
+            min_sdk: Some("26".to_owned()),
+            target_sdk: Some("35".to_owned()),
+            metadata: vec![(name.to_owned(), value.to_owned())],
+            ..ManifestReport::default()
         }
     }
 
@@ -873,6 +983,56 @@ mod tests {
         assert!(validate_package_name("com.roblox.client").is_ok());
         assert!(validate_package_name("../outside").is_err());
         assert!(validate_package_name("com..client").is_err());
+    }
+
+    #[test]
+    fn builds_bootstrap_config_from_manifest_and_validates_entry_library() {
+        let manifest = manifest_with_library("android.app.lib_name", "roblox");
+        let library = native_library("lib/arm64-v8a/libroblox.so", &[]);
+        let config = build_launch_config(&manifest, &[&library]).unwrap();
+
+        assert_eq!(config.schema_version, 1);
+        assert_eq!(config.package, "com.example");
+        assert_eq!(config.abi, "arm64-v8a");
+        assert_eq!(
+            config.launcher_activity.as_deref(),
+            Some("com.example.MainActivity")
+        );
+        assert_eq!(
+            config.native_library.as_deref(),
+            Some("native/arm64-v8a/libroblox.so")
+        );
+        assert_eq!(config.apk_path, "apk/base.apk");
+    }
+
+    #[test]
+    fn rejects_missing_or_unsafe_manifest_entry_library() {
+        let manifest = manifest_with_library("android.app.lib_name", "roblox");
+        assert!(
+            build_launch_config(&manifest, &[])
+                .unwrap_err()
+                .to_string()
+                .contains("não foi encontrada")
+        );
+
+        for invalid in ["../outside", "roblox/path", ""] {
+            assert!(native_library_path(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn serializes_launch_config_as_parseable_json() {
+        let manifest = manifest_with_library("android.app.lib_name", "libroblox.so");
+        let library = native_library("lib/arm64-v8a/libroblox.so", &[]);
+        let config = build_launch_config(&manifest, &[&library]).unwrap();
+        let json = serde_json::to_string(&config).unwrap();
+        let decoded: AppLaunchConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded.package, "com.example");
+        assert_eq!(
+            decoded.native_library.as_deref(),
+            Some("native/arm64-v8a/libroblox.so")
+        );
     }
 
     #[test]
