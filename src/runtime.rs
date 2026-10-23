@@ -578,6 +578,14 @@ fn write_load_plan_report(path: &Path, libraries: &[&crate::apk::NativeLibrary])
             writeln!(report, "DT_FINI_ARRAY: 0x{address:x} ({size} bytes)")
                 .expect("escrever em String não falha");
         }
+        if let Some(tls) = &elf.tls_plan {
+            writeln!(
+                report,
+                "PT_TLS: vaddr=0x{:x} file=0x{:x}+0x{:x} mem=0x{:x} align=0x{:x}",
+                tls.virtual_address, tls.file_offset, tls.file_size, tls.memory_size, tls.alignment
+            )
+            .expect("escrever em String não falha");
+        }
         if elf.relocation_types.is_empty() {
             writeln!(report, "Relocations dinâmicas: nenhuma")
                 .expect("escrever em String não falha");
@@ -1247,6 +1255,7 @@ mod tests {
                     segments: Vec::new(),
                 }),
                 init_plan: crate::elf::ElfInitPlan::default(),
+                tls_plan: None,
                 relocation_types: BTreeMap::new(),
                 relocations: Vec::new(),
                 dynamic_symbols: Vec::new(),

@@ -294,6 +294,7 @@ mod tests {
                     segments: Vec::new(),
                 }),
                 init_plan: crate::elf::ElfInitPlan::default(),
+                tls_plan: None,
                 relocation_types: BTreeMap::new(),
                 relocations: Vec::new(),
                 dynamic_symbols: Vec::new(),

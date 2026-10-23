@@ -39,6 +39,15 @@ pub struct ElfInitPlan {
     pub fini_array: Option<(u64, u64)>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ElfTlsPlan {
+    pub virtual_address: u64,
+    pub file_offset: u64,
+    pub file_size: u64,
+    pub memory_size: u64,
+    pub alignment: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ResolvedElfInitPlan {
     pub init_functions: Vec<u64>,
@@ -100,6 +109,7 @@ pub struct ElfReport {
     pub has_dynamic_segment: bool,
     pub load_plan: Option<ElfLoadPlan>,
     pub init_plan: ElfInitPlan,
+    pub tls_plan: Option<ElfTlsPlan>,
     pub relocation_types: BTreeMap<String, usize>,
     pub relocations: Vec<ElfRelocation>,
     pub dynamic_symbols: Vec<ElfDynamicSymbol>,
@@ -162,6 +172,7 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
         Some(build_load_plan(bytes.len() as u64, &load_segments)?)
     };
     let init_plan = parse_init_plan(bytes, &elf)?;
+    let tls_plan = parse_tls_plan(bytes.len() as u64, &elf.program_headers)?;
     let symbol_versions = symbol_versions(&elf);
     let mut relocations = elf
         .dynrelas
@@ -261,6 +272,7 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
         has_dynamic_segment,
         load_plan,
         init_plan,
+        tls_plan,
         relocation_types,
         relocations,
         dynamic_symbols,
@@ -500,6 +512,69 @@ fn parse_init_plan(bytes: &[u8], elf: &Elf<'_>) -> Result<ElfInitPlan> {
             pointer_size,
         )?,
     })
+}
+
+fn parse_tls_plan(
+    file_size: u64,
+    program_headers: &[goblin::elf::ProgramHeader],
+) -> Result<Option<ElfTlsPlan>> {
+    let mut tls = program_headers
+        .iter()
+        .filter(|segment| segment.p_type == program_header::PT_TLS);
+    let Some(segment) = tls.next() else {
+        return Ok(None);
+    };
+    if tls.next().is_some() {
+        anyhow::bail!("ELF contém mais de um segmento PT_TLS");
+    }
+    if segment.p_filesz > segment.p_memsz {
+        anyhow::bail!("segmento PT_TLS tem p_filesz maior que p_memsz");
+    }
+    let file_end = segment
+        .p_offset
+        .checked_add(segment.p_filesz)
+        .context("overflow no intervalo de arquivo PT_TLS")?;
+    if file_end > file_size {
+        anyhow::bail!("segmento PT_TLS excede o tamanho do ELF");
+    }
+    let virtual_end = segment
+        .p_vaddr
+        .checked_add(segment.p_memsz)
+        .context("overflow no intervalo virtual PT_TLS")?;
+    if segment.p_align > 1
+        && (!segment.p_align.is_power_of_two()
+            || segment.p_offset % segment.p_align != segment.p_vaddr % segment.p_align)
+    {
+        anyhow::bail!("alinhamento inválido no segmento PT_TLS");
+    }
+
+    let contained_in_load_segment = program_headers
+        .iter()
+        .filter(|load| load.p_type == program_header::PT_LOAD)
+        .any(|load| {
+            let Some(load_file_end) = load.p_offset.checked_add(load.p_filesz) else {
+                return false;
+            };
+            let Some(load_virtual_end) = load.p_vaddr.checked_add(load.p_memsz) else {
+                return false;
+            };
+            segment.p_offset >= load.p_offset
+                && segment.p_vaddr >= load.p_vaddr
+                && segment.p_offset - load.p_offset == segment.p_vaddr - load.p_vaddr
+                && file_end <= load_file_end
+                && virtual_end <= load_virtual_end
+        });
+    if !contained_in_load_segment {
+        anyhow::bail!("segmento PT_TLS não está contido em um PT_LOAD compatível");
+    }
+
+    Ok(Some(ElfTlsPlan {
+        virtual_address: segment.p_vaddr,
+        file_offset: segment.p_offset,
+        file_size: segment.p_filesz,
+        memory_size: segment.p_memsz,
+        alignment: segment.p_align,
+    }))
 }
 
 fn parse_relr_relocations(
@@ -1182,6 +1257,7 @@ mod tests {
                 segments: Vec::new(),
             }),
             init_plan: ElfInitPlan::default(),
+            tls_plan: None,
             relocation_types: BTreeMap::new(),
             relocations: Vec::new(),
             dynamic_symbols: Vec::new(),
@@ -1289,9 +1365,20 @@ mod tests {
         bytes[32..40].copy_from_slice(&64_u64.to_le_bytes());
         bytes[52..54].copy_from_slice(&64_u16.to_le_bytes());
         bytes[54..56].copy_from_slice(&56_u16.to_le_bytes());
-        bytes[56..58].copy_from_slice(&2_u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&3_u16.to_le_bytes());
         write_test_program_header(&mut bytes, 64, 1, 7, 0, 0, 0x200, 0x200, 0x1000);
         write_test_program_header(&mut bytes, 120, 2, 6, 0x100, 0x100, 128, 128, 8);
+        write_test_program_header(
+            &mut bytes,
+            176,
+            program_header::PT_TLS,
+            4,
+            0x1d0,
+            0x1d0,
+            16,
+            32,
+            8,
+        );
         let dynamic_entries: [(u64, u64); 8] = [
             (DT_RELR_TAG, 0x180),
             (DT_RELRSZ_TAG, 16),
@@ -1313,6 +1400,9 @@ mod tests {
         let elf = Elf::parse(&bytes).unwrap();
         let relr = parse_relr_relocations(&bytes, &elf.program_headers, &elf).unwrap();
         let init_plan = parse_init_plan(&bytes, &elf).unwrap();
+        let tls_plan = parse_tls_plan(bytes.len() as u64, &elf.program_headers)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(
             relr.iter()
@@ -1327,6 +1417,11 @@ mod tests {
         assert_eq!(init_plan.init_array, Some((0x1c0, 16)));
         assert_eq!(init_plan.fini, Some(0x48));
         assert_eq!(init_plan.fini_array, None);
+        assert_eq!(tls_plan.virtual_address, 0x1d0);
+        assert_eq!(tls_plan.file_offset, 0x1d0);
+        assert_eq!(tls_plan.file_size, 16);
+        assert_eq!(tls_plan.memory_size, 32);
+        assert_eq!(tls_plan.alignment, 8);
 
         let mut invalid_init_address = bytes.clone();
         invalid_init_address[0x100 + 3 * 16 + 8..0x100 + 4 * 16]
@@ -1339,6 +1434,28 @@ mod tests {
             .copy_from_slice(&12_u64.to_le_bytes());
         let invalid_array_elf = Elf::parse(&invalid_array_size).unwrap();
         assert!(parse_init_plan(&invalid_array_size, &invalid_array_elf).is_err());
+
+        let mut invalid_tls_size = bytes.clone();
+        invalid_tls_size[176 + 32..176 + 40].copy_from_slice(&33_u64.to_le_bytes());
+        let invalid_tls_elf = Elf::parse(&invalid_tls_size).unwrap();
+        assert!(
+            parse_tls_plan(
+                invalid_tls_size.len() as u64,
+                &invalid_tls_elf.program_headers
+            )
+            .is_err()
+        );
+
+        let mut invalid_tls_alignment = bytes.clone();
+        invalid_tls_alignment[176 + 48..176 + 56].copy_from_slice(&3_u64.to_le_bytes());
+        let invalid_tls_elf = Elf::parse(&invalid_tls_alignment).unwrap();
+        assert!(
+            parse_tls_plan(
+                invalid_tls_alignment.len() as u64,
+                &invalid_tls_elf.program_headers
+            )
+            .is_err()
+        );
     }
 
     fn write_test_program_header(
