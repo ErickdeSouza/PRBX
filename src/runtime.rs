@@ -531,7 +531,7 @@ fn write_load_plan_report(path: &Path, libraries: &[&crate::apk::NativeLibrary])
         }
         writeln!(
             report,
-            "Suporte dinâmico: RELATIVE, ABS64/32/16, PREL64/32/16, GLOB_DAT e JUMP_SLOT; veja native-image-check"
+            "Suporte dinâmico: RELATIVE (RELA e DT_RELR), ABS64/32/16, PREL64/32/16, GLOB_DAT e JUMP_SLOT; veja native-image-check"
         )
         .expect("escrever em String não falha");
         let versioned_imports = elf

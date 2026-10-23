@@ -4,6 +4,9 @@ use memmap2::{MmapMut, MmapOptions};
 use std::collections::{BTreeMap, BTreeSet};
 
 const ELF_PAGE_SIZE: u64 = 4096;
+const DT_RELRSZ_TAG: u64 = 35;
+const DT_RELR_TAG: u64 = 36;
+const DT_RELRENT_TAG: u64 = 37;
 
 #[derive(Clone, Debug)]
 pub struct ElfLoadSegment {
@@ -144,7 +147,7 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
         Some(build_load_plan(bytes.len() as u64, &load_segments)?)
     };
     let symbol_versions = symbol_versions(&elf);
-    let relocations = elf
+    let mut relocations = elf
         .dynrelas
         .iter()
         .chain(elf.dynrels.iter())
@@ -177,6 +180,12 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
             }
         })
         .collect::<Vec<_>>();
+    if elf.header.e_machine == header::EM_AARCH64
+        && elf.header.e_ident[header::EI_CLASS] == header::ELFCLASS64
+        && little_endian
+    {
+        relocations.extend(parse_relr_relocations(bytes, &elf.program_headers, &elf)?);
+    }
     let mut relocation_types = BTreeMap::new();
     for relocation in &relocations {
         *relocation_types
@@ -312,6 +321,144 @@ fn symbol_versions(elf: &Elf<'_>) -> Vec<(Option<ElfSymbolVersion>, bool)> {
         .collect()
 }
 
+fn decode_relr_entries(entries: &[u64]) -> Result<Vec<u64>> {
+    let mut offsets = Vec::new();
+    let mut next_address = None;
+
+    for entry in entries {
+        if entry & 1 == 0 {
+            if entry % 8 != 0 {
+                anyhow::bail!("entrada de endereço DT_RELR não está alinhada a 8 bytes");
+            }
+            offsets.push(*entry);
+            next_address = Some(
+                entry
+                    .checked_add(8)
+                    .context("overflow ao avançar endereço DT_RELR")?,
+            );
+            continue;
+        }
+
+        let base =
+            next_address.context("bitmap DT_RELR aparece antes de uma entrada de endereço")?;
+        for bit in 1..64 {
+            if entry & (1_u64 << bit) != 0 {
+                let offset = base
+                    .checked_add((bit - 1) * 8)
+                    .context("overflow ao decodificar bitmap DT_RELR")?;
+                offsets.push(offset);
+            }
+        }
+        next_address = Some(
+            base.checked_add(63 * 8)
+                .context("overflow ao avançar bitmap DT_RELR")?,
+        );
+    }
+
+    Ok(offsets)
+}
+
+fn virtual_address_to_file_offset(
+    address: u64,
+    size: u64,
+    program_headers: &[goblin::elf::ProgramHeader],
+    file_size: usize,
+) -> Result<usize> {
+    for segment in program_headers
+        .iter()
+        .filter(|segment| segment.p_type == program_header::PT_LOAD)
+    {
+        let segment_end = segment
+            .p_vaddr
+            .checked_add(segment.p_filesz)
+            .context("overflow no intervalo PT_LOAD ao ler DT_RELR")?;
+        let requested_end = address
+            .checked_add(size)
+            .context("overflow no endereço virtual DT_RELR")?;
+        if address < segment.p_vaddr || requested_end > segment_end {
+            continue;
+        }
+        let file_offset = segment
+            .p_offset
+            .checked_add(address - segment.p_vaddr)
+            .context("overflow no offset de arquivo DT_RELR")?;
+        let file_end = file_offset
+            .checked_add(size)
+            .context("overflow no fim da tabela DT_RELR")?;
+        if file_end > file_size as u64 {
+            anyhow::bail!("tabela DT_RELR excede os limites do arquivo ELF");
+        }
+        return usize::try_from(file_offset).context("offset DT_RELR não cabe em usize");
+    }
+    anyhow::bail!("tabela DT_RELR não está contida em um PT_LOAD de arquivo")
+}
+
+fn parse_relr_relocations(
+    bytes: &[u8],
+    program_headers: &[goblin::elf::ProgramHeader],
+    elf: &Elf<'_>,
+) -> Result<Vec<ElfRelocation>> {
+    let Some(dynamic) = &elf.dynamic else {
+        return Ok(Vec::new());
+    };
+    let mut relr_address = None;
+    let mut relr_size = None;
+    let mut relr_entry_size = None;
+    for entry in &dynamic.dyns {
+        let slot = match entry.d_tag {
+            DT_RELR_TAG => &mut relr_address,
+            DT_RELRSZ_TAG => &mut relr_size,
+            DT_RELRENT_TAG => &mut relr_entry_size,
+            _ => continue,
+        };
+        if slot.replace(entry.d_val).is_some() {
+            anyhow::bail!("entrada DT_RELR duplicada");
+        }
+    }
+    if relr_address.is_none() && relr_size.is_none() && relr_entry_size.is_none() {
+        return Ok(Vec::new());
+    }
+    let address = relr_address.context("DT_RELR está ausente")?;
+    let size = relr_size.context("DT_RELRSZ está ausente")?;
+    let entry_size = relr_entry_size.context("DT_RELRENT está ausente")?;
+    if entry_size != 8 || size % entry_size != 0 {
+        anyhow::bail!("DT_RELRENT/DT_RELRSZ inválido para ELF64");
+    }
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    let file_offset = virtual_address_to_file_offset(address, size, program_headers, bytes.len())?;
+    let table_size = usize::try_from(size).context("tabela DT_RELR não cabe em usize")?;
+    let table_end = file_offset
+        .checked_add(table_size)
+        .context("overflow no intervalo da tabela DT_RELR")?;
+    let table = bytes
+        .get(file_offset..table_end)
+        .context("tabela DT_RELR excede o arquivo ELF")?;
+    let entries = table
+        .chunks_exact(8)
+        .map(|word| u64::from_le_bytes(word.try_into().expect("chunk tem oito bytes")))
+        .collect::<Vec<_>>();
+    let offsets = decode_relr_entries(&entries)?;
+    Ok(offsets
+        .into_iter()
+        .map(|offset| ElfRelocation {
+            offset,
+            addend: None,
+            relocation_type: reloc::R_AARCH64_RELATIVE,
+            relocation_name: "R_AARCH64_RELATIVE_RELR".to_owned(),
+            symbol_index: 0,
+            symbol_name: None,
+            symbol_value: None,
+            symbol_defined: false,
+            symbol_absolute: false,
+            symbol_weak: false,
+            symbol_version: None,
+            symbol_version_unknown: false,
+        })
+        .collect())
+}
+
 pub fn map_load_image(
     file_bytes: &[u8],
     plan: &ElfLoadPlan,
@@ -398,10 +545,30 @@ impl MappedElfImage {
                     if relocation.symbol_index != 0 {
                         anyhow::bail!("R_AARCH64_RELATIVE deve usar índice de símbolo zero");
                     }
-                    let addend = relocation
-                        .addend
-                        .context("R_AARCH64_RELATIVE exige addend explícito RELA")?;
-                    let value = i128::from(self.load_bias) + i128::from(addend);
+                    let addend = match relocation.addend {
+                        Some(addend) => i128::from(addend),
+                        None if relocation.relocation_name == "R_AARCH64_RELATIVE_RELR" => {
+                            let relative_offset =
+                                relocation
+                                    .offset
+                                    .checked_sub(plan.image_start)
+                                    .context("offset DT_RELR antecede o início da imagem")?;
+                            let start = usize::try_from(relative_offset)
+                                .context("offset DT_RELR não cabe em usize")?;
+                            let end = start.checked_add(8).context("overflow no addend DT_RELR")?;
+                            let addend = self
+                                .mapping
+                                .get(start..end)
+                                .context("addend DT_RELR excede a imagem mapeada")?;
+                            i128::from(u64::from_le_bytes(
+                                addend.try_into().expect("slice tem oito bytes"),
+                            ))
+                        }
+                        None => {
+                            anyhow::bail!("R_AARCH64_RELATIVE exige addend explícito RELA")
+                        }
+                    };
+                    let value = i128::from(self.load_bias) + addend;
                     (8, value, false)
                 }
                 reloc::R_AARCH64_ABS64
@@ -905,6 +1072,83 @@ mod tests {
     }
 
     #[test]
+    fn decodes_relr_address_and_bitmap_entries_with_checked_offsets() {
+        let entries = [0x1000, (1 << 1) | (1 << 4) | 1, 0x1200];
+        assert_eq!(
+            decode_relr_entries(&entries).unwrap(),
+            vec![0x1000, 0x1008, 0x1020, 0x1200]
+        );
+        assert!(decode_relr_entries(&[1]).is_err());
+        assert!(decode_relr_entries(&[0x1001]).is_err());
+        assert!(decode_relr_entries(&[u64::MAX - 7]).is_err());
+    }
+
+    #[test]
+    fn reads_dt_relr_table_from_an_elf_load_segment() {
+        let mut bytes = vec![0; 0x200];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = header::ELFCLASS64;
+        bytes[5] = header::ELFDATA2LSB;
+        bytes[6] = 1;
+        bytes[16..18].copy_from_slice(&header::ET_DYN.to_le_bytes());
+        bytes[18..20].copy_from_slice(&header::EM_AARCH64.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[32..40].copy_from_slice(&64_u64.to_le_bytes());
+        bytes[52..54].copy_from_slice(&64_u16.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&2_u16.to_le_bytes());
+        write_test_program_header(&mut bytes, 64, 1, 6, 0, 0, 0x200, 0x200, 0x1000);
+        write_test_program_header(&mut bytes, 120, 2, 6, 0x100, 0x100, 64, 64, 8);
+        let dynamic_entries: [(u64, u64); 4] = [
+            (DT_RELR_TAG, 0x180),
+            (DT_RELRSZ_TAG, 16),
+            (DT_RELRENT_TAG, 8),
+            (0, 0),
+        ];
+        for (index, (tag, value)) in dynamic_entries.into_iter().enumerate() {
+            let offset = 0x100 + index * 16;
+            bytes[offset..offset + 8].copy_from_slice(&tag.to_le_bytes());
+            bytes[offset + 8..offset + 16].copy_from_slice(&value.to_le_bytes());
+        }
+        bytes[0x180..0x188].copy_from_slice(&0x20_u64.to_le_bytes());
+        bytes[0x188..0x190].copy_from_slice(&(1_u64 | (1 << 2)).to_le_bytes());
+
+        let elf = Elf::parse(&bytes).unwrap();
+        let relr = parse_relr_relocations(&bytes, &elf.program_headers, &elf).unwrap();
+
+        assert_eq!(
+            relr.iter()
+                .map(|relocation| relocation.offset)
+                .collect::<Vec<_>>(),
+            vec![0x20, 0x30]
+        );
+        assert!(relr.iter().all(|relocation| {
+            relocation.relocation_name == "R_AARCH64_RELATIVE_RELR" && relocation.addend.is_none()
+        }));
+    }
+
+    fn write_test_program_header(
+        bytes: &mut [u8],
+        offset: usize,
+        kind: u32,
+        flags: u32,
+        file_offset: u64,
+        virtual_address: u64,
+        file_size: u64,
+        memory_size: u64,
+        alignment: u64,
+    ) {
+        bytes[offset..offset + 4].copy_from_slice(&kind.to_le_bytes());
+        bytes[offset + 4..offset + 8].copy_from_slice(&flags.to_le_bytes());
+        bytes[offset + 8..offset + 16].copy_from_slice(&file_offset.to_le_bytes());
+        bytes[offset + 16..offset + 24].copy_from_slice(&virtual_address.to_le_bytes());
+        bytes[offset + 24..offset + 32].copy_from_slice(&virtual_address.to_le_bytes());
+        bytes[offset + 32..offset + 40].copy_from_slice(&file_size.to_le_bytes());
+        bytes[offset + 40..offset + 48].copy_from_slice(&memory_size.to_le_bytes());
+        bytes[offset + 48..offset + 56].copy_from_slice(&alignment.to_le_bytes());
+    }
+
+    #[test]
     fn applies_relative_relocations_using_load_bias_and_addend() {
         let relocations = [
             ElfRelocation {
@@ -1092,6 +1336,56 @@ mod tests {
             image.unresolved_relocations,
             vec!["external_symbol".to_owned()]
         );
+    }
+
+    #[test]
+    fn applies_relr_relocations_using_implicit_addends_from_image_memory() {
+        let plan = ElfLoadPlan {
+            page_size: ELF_PAGE_SIZE,
+            image_start: 0x1000,
+            image_end: 0x2000,
+            image_size: 0x1000,
+            segments: vec![ElfLoadSegment {
+                file_offset: 0,
+                virtual_address: 0x1000,
+                file_size: 0x40,
+                memory_size: 0x40,
+                alignment: 1,
+                mapped_start: 0x1000,
+                mapped_end: 0x2000,
+                readable: true,
+                writable: true,
+                executable: false,
+            }],
+        };
+        let mut file_bytes = vec![0; 0x40];
+        file_bytes[0x10..0x18].copy_from_slice(&0x1234_u64.to_le_bytes());
+        let relocation = ElfRelocation {
+            offset: 0x1010,
+            addend: None,
+            relocation_type: reloc::R_AARCH64_RELATIVE,
+            relocation_name: "R_AARCH64_RELATIVE_RELR".to_owned(),
+            symbol_index: 0,
+            symbol_name: None,
+            symbol_value: None,
+            symbol_defined: false,
+            symbol_absolute: false,
+            symbol_weak: false,
+            symbol_version: None,
+            symbol_version_unknown: false,
+        };
+        let mut image = map_load_image(&file_bytes, &plan, ELF_PAGE_SIZE).unwrap();
+        let load_bias = image.load_bias;
+
+        image
+            .apply_relocations(&plan, &[relocation], &BTreeMap::new())
+            .unwrap();
+
+        assert_eq!(
+            u64::from_le_bytes(image.bytes()[0x10..0x18].try_into().unwrap()),
+            load_bias + 0x1234
+        );
+        assert_eq!(image.relative_relocations_applied, 1);
     }
 
     #[test]
