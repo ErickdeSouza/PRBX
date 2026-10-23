@@ -2,6 +2,8 @@
 
 Ferramentas em Rust para inventariar APKs e preparar a árvore de arquivos isolada do runtime em desenvolvimento. O inspetor não executa nem altera o APK; o preparador ainda não executa código Android.
 
+Desenvolvimento separado por plataforma: `main` mantém a versão para Windows e `master` é a linha Linux. A branch Linux executa testes de permissões de memória em Ubuntu pela GitHub Actions.
+
 ## Uso
 
 ```powershell

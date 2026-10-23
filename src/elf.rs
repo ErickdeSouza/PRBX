@@ -2172,6 +2172,96 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_applies_real_page_permissions_and_relro_without_execute() {
+        fn permissions_at(address: u64) -> String {
+            let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+            for line in maps.lines() {
+                let mut fields = line.split_whitespace();
+                let range = fields.next().unwrap();
+                let permissions = fields.next().unwrap();
+                let (start, end) = range.split_once('-').unwrap();
+                let start = u64::from_str_radix(start, 16).unwrap();
+                let end = u64::from_str_radix(end, 16).unwrap();
+                if address >= start && address < end {
+                    return permissions.to_owned();
+                }
+            }
+            panic!("endereço {address:#x} não consta em /proc/self/maps");
+        }
+
+        let page = ELF_PAGE_SIZE;
+        let plan = ElfLoadPlan {
+            page_size: page,
+            image_start: 0x1000,
+            image_end: 0x4000,
+            image_size: page * 3,
+            segments: vec![
+                ElfLoadSegment {
+                    file_offset: 0,
+                    virtual_address: 0x1000,
+                    file_size: page,
+                    memory_size: page,
+                    alignment: page,
+                    mapped_start: 0x1000,
+                    mapped_end: 0x2000,
+                    readable: true,
+                    writable: false,
+                    executable: true,
+                },
+                ElfLoadSegment {
+                    file_offset: page,
+                    virtual_address: 0x2000,
+                    file_size: page,
+                    memory_size: page,
+                    alignment: page,
+                    mapped_start: 0x2000,
+                    mapped_end: 0x3000,
+                    readable: true,
+                    writable: true,
+                    executable: false,
+                },
+                ElfLoadSegment {
+                    file_offset: page * 2,
+                    virtual_address: 0x3000,
+                    file_size: page,
+                    memory_size: page,
+                    alignment: page,
+                    mapped_start: 0x3000,
+                    mapped_end: 0x4000,
+                    readable: true,
+                    writable: true,
+                    executable: false,
+                },
+            ],
+        };
+        let relro = [ElfRelroPlan {
+            virtual_address: 0x2000,
+            memory_size: page,
+            page_start: 0x2000,
+            page_end: 0x3000,
+        }];
+        let bytes = vec![0x5a; (page * 3) as usize];
+        let mut image = map_load_image(&bytes, &plan, page * 3).unwrap();
+        let base = image.base_address();
+        image
+            .apply_final_page_protections_without_execute(&plan, &relro)
+            .unwrap();
+
+        let first_page = permissions_at(base);
+        let relro_page = permissions_at(base + page);
+        let writable_page = permissions_at(base + page * 2);
+        assert_eq!(&first_page[..3], "r--");
+        assert_eq!(&relro_page[..3], "r--");
+        assert_eq!(&writable_page[..3], "rw-");
+        assert!(
+            [&first_page, &relro_page, &writable_page]
+                .iter()
+                .all(|permissions| !permissions.as_bytes()[2..3].contains(&b'x'))
+        );
+    }
+
     #[test]
     fn applies_relr_relocations_using_implicit_addends_from_image_memory() {
         let plan = ElfLoadPlan {
