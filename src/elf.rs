@@ -40,6 +40,15 @@ pub struct ElfRelocation {
     pub symbol_defined: bool,
     pub symbol_absolute: bool,
     pub symbol_weak: bool,
+    pub symbol_version: Option<ElfSymbolVersion>,
+    pub symbol_version_unknown: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ElfSymbolVersion {
+    pub name: String,
+    pub hash: u32,
+    pub hidden: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +60,8 @@ pub struct ElfDynamicSymbol {
     pub global: bool,
     pub weak: bool,
     pub visible: bool,
+    pub version: Option<ElfSymbolVersion>,
+    pub version_unknown: bool,
 }
 
 pub struct MappedElfImage {
@@ -132,6 +143,7 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
     } else {
         Some(build_load_plan(bytes.len() as u64, &load_segments)?)
     };
+    let symbol_versions = symbol_versions(&elf);
     let relocations = elf
         .dynrelas
         .iter()
@@ -156,6 +168,12 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
                     .is_some_and(|symbol| symbol.st_shndx == section_header::SHN_ABS as usize),
                 symbol_weak: symbol
                     .is_some_and(|symbol| sym::st_bind(symbol.st_info) == sym::STB_WEAK),
+                symbol_version: symbol_versions
+                    .get(relocation.r_sym)
+                    .and_then(|metadata| metadata.0.clone()),
+                symbol_version_unknown: symbol_versions
+                    .get(relocation.r_sym)
+                    .is_some_and(|metadata| metadata.1),
             }
         })
         .collect::<Vec<_>>();
@@ -169,7 +187,7 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
     let mut exports = Vec::new();
     let mut dynamic_symbols = Vec::new();
 
-    for symbol in &elf.dynsyms {
+    for (symbol_index, symbol) in elf.dynsyms.iter().enumerate() {
         let Some(name) = elf.dynstrtab.get_at(symbol.st_name) else {
             continue;
         };
@@ -192,6 +210,12 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
                 sym::st_visibility(symbol.st_other),
                 sym::STV_DEFAULT | sym::STV_PROTECTED
             ),
+            version: symbol_versions
+                .get(symbol_index)
+                .and_then(|metadata| metadata.0.clone()),
+            version_unknown: symbol_versions
+                .get(symbol_index)
+                .is_some_and(|metadata| metadata.1),
         });
     }
 
@@ -224,6 +248,68 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
         exports,
         android_api_imports,
     })
+}
+
+fn symbol_versions(elf: &Elf<'_>) -> Vec<(Option<ElfSymbolVersion>, bool)> {
+    let mut versions = BTreeMap::<u16, (String, u32)>::new();
+    if let Some(verneed) = &elf.verneed {
+        for need in verneed {
+            for auxiliary in &need {
+                if let Some(name) = elf.dynstrtab.get_at(auxiliary.vna_name) {
+                    versions.insert(
+                        auxiliary.vna_other & 0x7fff,
+                        (name.to_owned(), auxiliary.vna_hash),
+                    );
+                }
+            }
+        }
+    }
+    if let Some(verdef) = &elf.verdef {
+        for definition in verdef {
+            if let Some(auxiliary) = definition.iter().next()
+                && let Some(name) = elf.dynstrtab.get_at(auxiliary.vda_name)
+            {
+                versions.insert(
+                    definition.vd_ndx & 0x7fff,
+                    (name.to_owned(), definition.vd_hash),
+                );
+            }
+        }
+    }
+
+    let has_dynamic_versym = elf.dynamic.as_ref().is_some_and(|dynamic| {
+        dynamic
+            .dyns
+            .iter()
+            .any(|entry| entry.d_tag == goblin::elf::dynamic::DT_VERSYM)
+    });
+    elf.dynsyms
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let Some(versym) = elf
+                .versym
+                .as_ref()
+                .and_then(|section| section.get_at(index))
+            else {
+                return (None, has_dynamic_versym);
+            };
+            if versym.is_global() || versym.is_local() {
+                return (None, false);
+            }
+            match versions.get(&versym.version()) {
+                Some((name, hash)) => (
+                    Some(ElfSymbolVersion {
+                        name: name.clone(),
+                        hash: *hash,
+                        hidden: versym.is_hidden(),
+                    }),
+                    false,
+                ),
+                None => (None, true),
+            }
+        })
+        .collect()
 }
 
 pub fn map_load_image(
@@ -342,16 +428,33 @@ impl MappedElfImage {
                         }
                     } else if relocation.symbol_index == 0 {
                         Some(0)
+                    } else if relocation.symbol_version_unknown {
+                        None
                     } else {
-                        symbol_name.and_then(|name| packaged_symbols.get(name).copied())
+                        symbol_name.and_then(|name| {
+                            packaged_symbols
+                                .get(&symbol_lookup_key(name, relocation.symbol_version.as_ref()))
+                                .copied()
+                        })
                     };
                     let symbol_address = match symbol_address {
                         Some(address) => address,
-                        None if relocation.symbol_weak => 0,
+                        None if relocation.symbol_weak && !relocation.symbol_version_unknown => 0,
                         None => {
                             unresolved.insert(
                                 symbol_name
-                                    .map(str::to_owned)
+                                    .map(|name| {
+                                        if relocation.symbol_version_unknown {
+                                            format!("{name}@<versão ELF não decodificada>")
+                                        } else {
+                                            match relocation.symbol_version.as_ref() {
+                                                Some(version) => {
+                                                    format!("{name}@{}", version.name)
+                                                }
+                                                None => name.to_owned(),
+                                            }
+                                        }
+                                    })
                                     .unwrap_or_else(|| relocation.relocation_name.clone()),
                             );
                             unresolved_count += 1;
@@ -429,6 +532,13 @@ impl MappedElfImage {
         self.unresolved_relocation_count = unresolved_count;
         self.unresolved_relocations = unresolved.into_iter().collect();
         Ok(())
+    }
+}
+
+pub fn symbol_lookup_key(name: &str, version: Option<&ElfSymbolVersion>) -> String {
+    match version {
+        Some(version) => format!("{name}\0{}:{:08x}", version.name, version.hash),
+        None => name.to_owned(),
     }
 }
 
@@ -808,6 +918,8 @@ mod tests {
                 symbol_defined: false,
                 symbol_absolute: false,
                 symbol_weak: false,
+                symbol_version: None,
+                symbol_version_unknown: false,
             },
             ElfRelocation {
                 offset: 0x1018,
@@ -820,6 +932,8 @@ mod tests {
                 symbol_defined: false,
                 symbol_absolute: false,
                 symbol_weak: false,
+                symbol_version: None,
+                symbol_version_unknown: false,
             },
         ];
         let mut image = [0; 0x40];
@@ -851,6 +965,8 @@ mod tests {
             symbol_defined: false,
             symbol_absolute: false,
             symbol_weak: false,
+            symbol_version: None,
+            symbol_version_unknown: false,
         };
         let mut image = [0; 16];
         let invalid = ElfRelocation {
@@ -945,6 +1061,8 @@ mod tests {
             symbol_defined: false,
             symbol_absolute: false,
             symbol_weak: false,
+            symbol_version: None,
+            symbol_version_unknown: false,
         };
         let unresolved = ElfRelocation {
             symbol_index: 1,
@@ -1032,6 +1150,8 @@ mod tests {
                 symbol_defined: false,
                 symbol_absolute: false,
                 symbol_weak: false,
+                symbol_version: None,
+                symbol_version_unknown: false,
             },
             ElfRelocation {
                 offset: 0x1018,
@@ -1044,6 +1164,8 @@ mod tests {
                 symbol_defined: false,
                 symbol_absolute: false,
                 symbol_weak: false,
+                symbol_version: None,
+                symbol_version_unknown: false,
             },
             ElfRelocation {
                 offset: 0x1020,
@@ -1056,6 +1178,8 @@ mod tests {
                 symbol_defined: false,
                 symbol_absolute: false,
                 symbol_weak: false,
+                symbol_version: None,
+                symbol_version_unknown: false,
             },
         ];
         let symbols = BTreeMap::from([
@@ -1077,6 +1201,125 @@ mod tests {
         }
         assert_eq!(image.symbol_relocations_applied, 3);
         assert!(image.unresolved_relocations.is_empty());
+    }
+
+    #[test]
+    fn resolves_versioned_symbols_only_against_the_requested_version() {
+        let plan = ElfLoadPlan {
+            page_size: ELF_PAGE_SIZE,
+            image_start: 0,
+            image_end: ELF_PAGE_SIZE,
+            image_size: ELF_PAGE_SIZE,
+            segments: vec![ElfLoadSegment {
+                file_offset: 0,
+                virtual_address: 0,
+                file_size: 0x40,
+                memory_size: 0x40,
+                alignment: 1,
+                mapped_start: 0,
+                mapped_end: ELF_PAGE_SIZE,
+                readable: true,
+                writable: true,
+                executable: false,
+            }],
+        };
+        let requested = ElfSymbolVersion {
+            name: "LIB_2".to_owned(),
+            hash: 0x1234,
+            hidden: false,
+        };
+        let relocation = ElfRelocation {
+            offset: 8,
+            addend: Some(0),
+            relocation_type: reloc::R_AARCH64_GLOB_DAT,
+            relocation_name: "R_AARCH64_GLOB_DAT".to_owned(),
+            symbol_index: 1,
+            symbol_name: Some("versioned_api".to_owned()),
+            symbol_value: None,
+            symbol_defined: false,
+            symbol_absolute: false,
+            symbol_weak: false,
+            symbol_version: Some(requested.clone()),
+            symbol_version_unknown: false,
+        };
+        let symbols =
+            BTreeMap::from([(symbol_lookup_key("versioned_api", Some(&requested)), 0x5678)]);
+        let mut image = map_load_image(&[0; 0x40], &plan, ELF_PAGE_SIZE).unwrap();
+        image
+            .apply_relocations(&plan, &[relocation.clone()], &symbols)
+            .unwrap();
+        assert_eq!(
+            u64::from_le_bytes(image.bytes()[8..16].try_into().unwrap()),
+            0x5678
+        );
+
+        let mismatched = BTreeMap::from([(
+            symbol_lookup_key(
+                "versioned_api",
+                Some(&ElfSymbolVersion {
+                    name: "LIB_1".to_owned(),
+                    hash: 0x4321,
+                    hidden: false,
+                }),
+            ),
+            0x9999,
+        )]);
+        let mut image = map_load_image(&[0; 0x40], &plan, ELF_PAGE_SIZE).unwrap();
+        image
+            .apply_relocations(&plan, &[relocation], &mismatched)
+            .unwrap();
+        assert_eq!(image.symbol_relocations_applied, 0);
+        assert_eq!(image.unresolved_relocations, vec!["versioned_api@LIB_2"]);
+    }
+
+    #[test]
+    fn keeps_imports_pending_when_elf_version_metadata_is_unavailable() {
+        let plan = ElfLoadPlan {
+            page_size: ELF_PAGE_SIZE,
+            image_start: 0,
+            image_end: ELF_PAGE_SIZE,
+            image_size: ELF_PAGE_SIZE,
+            segments: vec![ElfLoadSegment {
+                file_offset: 0,
+                virtual_address: 0,
+                file_size: 0x40,
+                memory_size: 0x40,
+                alignment: 1,
+                mapped_start: 0,
+                mapped_end: ELF_PAGE_SIZE,
+                readable: true,
+                writable: true,
+                executable: false,
+            }],
+        };
+        let relocation = ElfRelocation {
+            offset: 8,
+            addend: Some(0),
+            relocation_type: reloc::R_AARCH64_GLOB_DAT,
+            relocation_name: "R_AARCH64_GLOB_DAT".to_owned(),
+            symbol_index: 1,
+            symbol_name: Some("versioned_api".to_owned()),
+            symbol_value: None,
+            symbol_defined: false,
+            symbol_absolute: false,
+            symbol_weak: true,
+            symbol_version: None,
+            symbol_version_unknown: true,
+        };
+        let mut image = map_load_image(&[0; 0x40], &plan, ELF_PAGE_SIZE).unwrap();
+        image
+            .apply_relocations(
+                &plan,
+                &[relocation],
+                &BTreeMap::from([("versioned_api".to_owned(), 0x5678)]),
+            )
+            .unwrap();
+
+        assert_eq!(image.symbol_relocations_applied, 0);
+        assert_eq!(
+            image.unresolved_relocations,
+            vec!["versioned_api@<versão ELF não decodificada>"]
+        );
     }
 
     #[test]
@@ -1112,6 +1355,8 @@ mod tests {
             symbol_defined: false,
             symbol_absolute: false,
             symbol_weak: false,
+            symbol_version: None,
+            symbol_version_unknown: false,
         };
         let relocations = [
             relocation(0x1010, reloc::R_AARCH64_ABS16, "ABS16", "abs16"),
@@ -1186,6 +1431,8 @@ mod tests {
             symbol_defined: false,
             symbol_absolute: false,
             symbol_weak: false,
+            symbol_version: None,
+            symbol_version_unknown: false,
         };
         let overflow = ElfRelocation {
             offset: 16,
@@ -1245,6 +1492,8 @@ mod tests {
             symbol_defined: false,
             symbol_absolute: false,
             symbol_weak: true,
+            symbol_version: None,
+            symbol_version_unknown: false,
         };
         let strong = ElfRelocation {
             offset: 16,

@@ -534,6 +534,39 @@ fn write_load_plan_report(path: &Path, libraries: &[&crate::apk::NativeLibrary])
             "Suporte dinâmico: RELATIVE, ABS64/32/16, PREL64/32/16, GLOB_DAT e JUMP_SLOT; veja native-image-check"
         )
         .expect("escrever em String não falha");
+        let versioned_imports = elf
+            .relocations
+            .iter()
+            .filter_map(|relocation| {
+                let symbol = relocation.symbol_name.as_deref()?;
+                let version = relocation.symbol_version.as_ref()?;
+                Some((
+                    symbol.to_owned(),
+                    version.name.clone(),
+                    version.hash,
+                    version.hidden,
+                ))
+            })
+            .collect::<BTreeSet<_>>();
+        for (symbol, version, hash, hidden) in versioned_imports {
+            writeln!(
+                report,
+                "Import versionado: {symbol}@{version} hash=0x{hash:08x} hidden={hidden}"
+            )
+            .expect("escrever em String não falha");
+        }
+        let unknown_versions = elf
+            .relocations
+            .iter()
+            .filter(|relocation| relocation.symbol_version_unknown)
+            .count();
+        if unknown_versions > 0 {
+            writeln!(
+                report,
+                "Relocations com versão ELF não decodificada: {unknown_versions} (mantidas pendentes)"
+            )
+            .expect("escrever em String não falha");
+        }
         for (index, segment) in plan.segments.iter().enumerate() {
             let permissions = format!(
                 "{}{}{}",
@@ -683,7 +716,11 @@ fn packaged_symbol_scope(
             .1
             .load_bias;
         for symbol in &elf.dynamic_symbols {
-            if !symbol.defined || !symbol.visible || !(symbol.global || symbol.weak) {
+            if !symbol.defined
+                || !symbol.visible
+                || symbol.version_unknown
+                || !(symbol.global || symbol.weak)
+            {
                 continue;
             }
             let address = if symbol.absolute {
@@ -693,16 +730,15 @@ fn packaged_symbol_scope(
                     .checked_add(symbol.value)
                     .with_context(|| format!("endereço ELF excedido para {}", symbol.name))?
             };
-            match symbols.entry(symbol.name.clone()) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert((address, symbol.weak));
-                }
-                std::collections::btree_map::Entry::Occupied(mut entry)
-                    if entry.get().1 && !symbol.weak =>
-                {
-                    entry.insert((address, false));
-                }
-                std::collections::btree_map::Entry::Occupied(_) => {}
+            let versioned_key =
+                crate::elf::symbol_lookup_key(&symbol.name, symbol.version.as_ref());
+            insert_scoped_symbol(&mut symbols, versioned_key, address, symbol.weak);
+            if symbol
+                .version
+                .as_ref()
+                .is_none_or(|version| !version.hidden)
+            {
+                insert_scoped_symbol(&mut symbols, symbol.name.clone(), address, symbol.weak);
             }
         }
         queue.extend(elf.needed.iter().cloned());
@@ -713,6 +749,23 @@ fn packaged_symbol_scope(
         scope.insert(name, address);
     }
     Ok(scope)
+}
+
+fn insert_scoped_symbol(
+    symbols: &mut BTreeMap<String, (u64, bool)>,
+    key: String,
+    address: u64,
+    weak: bool,
+) {
+    match symbols.entry(key) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert((address, weak));
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry) if entry.get().1 && !weak => {
+            entry.insert((address, false));
+        }
+        std::collections::btree_map::Entry::Occupied(_) => {}
+    }
 }
 
 fn native_library_indices(
@@ -1356,6 +1409,8 @@ mod tests {
                 global: false,
                 weak: true,
                 visible: true,
+                version: None,
+                version_unknown: false,
             });
         libraries[2]
             .elf
@@ -1370,6 +1425,8 @@ mod tests {
                 global: true,
                 weak: false,
                 visible: true,
+                version: None,
+                version_unknown: false,
             });
         libraries[3]
             .elf
@@ -1384,6 +1441,8 @@ mod tests {
                 global: true,
                 weak: false,
                 visible: true,
+                version: None,
+                version_unknown: false,
             });
         libraries[4]
             .elf
@@ -1398,7 +1457,41 @@ mod tests {
                 global: true,
                 weak: false,
                 visible: true,
+                version: None,
+                version_unknown: false,
             });
+        libraries[1].elf.as_mut().unwrap().dynamic_symbols.extend([
+            crate::elf::ElfDynamicSymbol {
+                name: "compat_api".to_owned(),
+                value: 0x60,
+                defined: true,
+                absolute: false,
+                global: true,
+                weak: false,
+                visible: true,
+                version: Some(crate::elf::ElfSymbolVersion {
+                    name: "LIB_1".to_owned(),
+                    hash: 0x1111,
+                    hidden: true,
+                }),
+                version_unknown: false,
+            },
+            crate::elf::ElfDynamicSymbol {
+                name: "compat_api".to_owned(),
+                value: 0x70,
+                defined: true,
+                absolute: false,
+                global: true,
+                weak: false,
+                visible: true,
+                version: Some(crate::elf::ElfSymbolVersion {
+                    name: "LIB_2".to_owned(),
+                    hash: 0x2222,
+                    hidden: false,
+                }),
+                version_unknown: false,
+            },
+        ]);
 
         let library_refs = libraries.iter().collect::<Vec<_>>();
         let images = library_refs
@@ -1420,6 +1513,29 @@ mod tests {
         assert_eq!(scope["shared_symbol"], images[2].1.load_bias + 0x30);
         assert_eq!(scope["transitive_symbol"], images[3].1.load_bias + 0x40);
         assert!(!scope.contains_key("unrelated_symbol"));
+        assert_eq!(scope["compat_api"], images[1].1.load_bias + 0x70);
+        assert_eq!(
+            scope[&crate::elf::symbol_lookup_key(
+                "compat_api",
+                Some(&crate::elf::ElfSymbolVersion {
+                    name: "LIB_1".to_owned(),
+                    hash: 0x1111,
+                    hidden: true,
+                })
+            )],
+            images[1].1.load_bias + 0x60
+        );
+        assert_eq!(
+            scope[&crate::elf::symbol_lookup_key(
+                "compat_api",
+                Some(&crate::elf::ElfSymbolVersion {
+                    name: "LIB_2".to_owned(),
+                    hash: 0x2222,
+                    hidden: false,
+                })
+            )],
+            images[1].1.load_bias + 0x70
+        );
     }
 
     #[test]
