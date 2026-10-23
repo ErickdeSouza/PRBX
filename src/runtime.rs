@@ -448,6 +448,11 @@ fn write_load_plan_report(path: &Path, libraries: &[&crate::apk::NativeLibrary])
                 writeln!(report, "  {relocation}: {count}").expect("escrever em String não falha");
             }
         }
+        writeln!(
+            report,
+            "R_AARCH64_RELATIVE: aplicador em buffer disponível; ainda não conectado a memória mapeada"
+        )
+        .expect("escrever em String não falha");
         for (index, segment) in plan.segments.iter().enumerate() {
             let permissions = format!(
                 "{}{}{}",
@@ -876,6 +881,7 @@ mod tests {
                     segments: Vec::new(),
                 }),
                 relocation_types: BTreeMap::new(),
+                relocations: Vec::new(),
                 needed: needed.iter().map(|name| (*name).to_owned()).collect(),
                 imports: Vec::new(),
                 exports: Vec::new(),

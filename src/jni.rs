@@ -294,6 +294,7 @@ mod tests {
                     segments: Vec::new(),
                 }),
                 relocation_types: BTreeMap::new(),
+                relocations: Vec::new(),
                 needed: Vec::new(),
                 imports: Vec::new(),
                 exports: exports.iter().map(|name| (*name).to_owned()).collect(),

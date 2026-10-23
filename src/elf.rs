@@ -27,6 +27,16 @@ pub struct ElfLoadPlan {
     pub segments: Vec<ElfLoadSegment>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ElfRelocation {
+    pub offset: u64,
+    pub addend: Option<i64>,
+    pub relocation_type: u32,
+    pub relocation_name: String,
+    pub symbol_index: usize,
+    pub symbol_name: Option<String>,
+}
+
 pub struct ElfReport {
     pub class: &'static str,
     pub machine: &'static str,
@@ -37,6 +47,7 @@ pub struct ElfReport {
     pub has_dynamic_segment: bool,
     pub load_plan: Option<ElfLoadPlan>,
     pub relocation_types: BTreeMap<String, usize>,
+    pub relocations: Vec<ElfRelocation>,
     pub needed: Vec<String>,
     pub imports: Vec<String>,
     pub exports: Vec<String>,
@@ -94,15 +105,32 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
     } else {
         Some(build_load_plan(bytes.len() as u64, &load_segments)?)
     };
-    let mut relocation_types = BTreeMap::new();
-    for relocation in elf
+    let relocations = elf
         .dynrelas
         .iter()
         .chain(elf.dynrels.iter())
         .chain(elf.pltrelocs.iter())
-    {
+        .map(|relocation| {
+            let symbol_name = elf
+                .dynsyms
+                .get(relocation.r_sym)
+                .and_then(|symbol| elf.dynstrtab.get_at(symbol.st_name))
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned);
+            ElfRelocation {
+                offset: relocation.r_offset,
+                addend: relocation.r_addend,
+                relocation_type: relocation.r_type,
+                relocation_name: relocation_name(relocation.r_type),
+                symbol_index: relocation.r_sym,
+                symbol_name,
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut relocation_types = BTreeMap::new();
+    for relocation in &relocations {
         *relocation_types
-            .entry(relocation_name(relocation.r_type))
+            .entry(relocation.relocation_name.clone())
             .or_insert(0) += 1;
     }
     let mut imports = Vec::new();
@@ -139,6 +167,7 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
         has_dynamic_segment,
         load_plan,
         relocation_types,
+        relocations,
         needed: elf
             .libraries
             .iter()
@@ -148,6 +177,48 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
         exports,
         android_api_imports,
     })
+}
+
+pub fn apply_relative_relocations(
+    image: &mut [u8],
+    image_start: u64,
+    load_bias: u64,
+    relocations: &[ElfRelocation],
+) -> Result<usize> {
+    let mut writes = Vec::new();
+    for relocation in relocations {
+        if relocation.relocation_type != reloc::R_AARCH64_RELATIVE {
+            anyhow::bail!(
+                "relocation {} não é suportada nesta etapa",
+                relocation.relocation_name
+            );
+        }
+        if relocation.symbol_index != 0 {
+            anyhow::bail!("R_AARCH64_RELATIVE deve usar índice de símbolo zero");
+        }
+        let addend = relocation
+            .addend
+            .context("R_AARCH64_RELATIVE exige addend explícito RELA")?;
+        let image_offset = relocation
+            .offset
+            .checked_sub(image_start)
+            .context("offset da relocation antecede o início da imagem")?;
+        let start = usize::try_from(image_offset).context("offset ELF não cabe em usize")?;
+        let end = start
+            .checked_add(8)
+            .context("overflow no campo de relocation ELF")?;
+        if end > image.len() {
+            anyhow::bail!("alvo de relocation excede a imagem mapeada");
+        }
+        let value = i128::from(load_bias) + i128::from(addend);
+        let value = u64::try_from(value).context("resultado de R_AARCH64_RELATIVE excede u64")?;
+        writes.push((start, value));
+    }
+
+    for (start, value) in &writes {
+        image[*start..*start + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    Ok(writes.len())
 }
 
 fn relocation_name(relocation_type: u32) -> String {
@@ -351,6 +422,7 @@ mod tests {
                 segments: Vec::new(),
             }),
             relocation_types: BTreeMap::new(),
+            relocations: Vec::new(),
             needed: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
@@ -427,6 +499,113 @@ mod tests {
             "R_AARCH64_JUMP_SLOT"
         );
         assert_eq!(relocation_name(12345), "R_AARCH64_UNKNOWN_12345");
+    }
+
+    #[test]
+    fn applies_relative_relocations_using_load_bias_and_addend() {
+        let relocations = [
+            ElfRelocation {
+                offset: 0x1010,
+                addend: Some(0x40),
+                relocation_type: reloc::R_AARCH64_RELATIVE,
+                relocation_name: "R_AARCH64_RELATIVE".to_owned(),
+                symbol_index: 0,
+                symbol_name: None,
+            },
+            ElfRelocation {
+                offset: 0x1018,
+                addend: Some(-8),
+                relocation_type: reloc::R_AARCH64_RELATIVE,
+                relocation_name: "R_AARCH64_RELATIVE".to_owned(),
+                symbol_index: 0,
+                symbol_name: None,
+            },
+        ];
+        let mut image = [0; 0x40];
+
+        assert_eq!(
+            apply_relative_relocations(&mut image, 0x1000, 0x7000, &relocations).unwrap(),
+            2
+        );
+        assert_eq!(
+            u64::from_le_bytes(image[0x10..0x18].try_into().unwrap()),
+            0x7040
+        );
+        assert_eq!(
+            u64::from_le_bytes(image[0x18..0x20].try_into().unwrap()),
+            0x6ff8
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_or_invalid_relative_relocations_without_partial_writes() {
+        let valid = ElfRelocation {
+            offset: 0x1000,
+            addend: Some(1),
+            relocation_type: reloc::R_AARCH64_RELATIVE,
+            relocation_name: "R_AARCH64_RELATIVE".to_owned(),
+            symbol_index: 0,
+            symbol_name: None,
+        };
+        let mut image = [0; 16];
+        let invalid = ElfRelocation {
+            offset: 0x1010,
+            ..valid.clone()
+        };
+        assert!(
+            apply_relative_relocations(&mut image, 0x1000, 0x2000, &[valid.clone(), invalid])
+                .is_err()
+        );
+        assert_eq!(image, [0; 16]);
+        assert!(
+            apply_relative_relocations(
+                &mut image,
+                0x1000,
+                0x2000,
+                &[ElfRelocation {
+                    addend: None,
+                    ..valid.clone()
+                }]
+            )
+            .is_err()
+        );
+        assert!(
+            apply_relative_relocations(
+                &mut image,
+                0x1000,
+                0x2000,
+                &[ElfRelocation {
+                    symbol_index: 1,
+                    ..valid.clone()
+                }]
+            )
+            .is_err()
+        );
+        assert!(
+            apply_relative_relocations(
+                &mut image,
+                0x1000,
+                0x2000,
+                &[ElfRelocation {
+                    relocation_type: reloc::R_AARCH64_JUMP_SLOT,
+                    relocation_name: "R_AARCH64_JUMP_SLOT".to_owned(),
+                    ..valid.clone()
+                }]
+            )
+            .is_err()
+        );
+        assert!(
+            apply_relative_relocations(
+                &mut image,
+                0x1000,
+                0,
+                &[ElfRelocation {
+                    addend: Some(-1),
+                    ..valid
+                }]
+            )
+            .is_err()
+        );
     }
 
     #[test]
