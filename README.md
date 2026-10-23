@@ -47,6 +47,7 @@ Esta etapa **não inicia o app**: ainda faltam carregador compatível com Bionic
 
 - Decodificação do manifesto binário para pacote, classe `Application`, launcher, SDK mínimo/alvo, componentes, permissões, recursos e metadados.
 - Inventário de arquivos multidex, métodos com o modificador DEX `native`, chamadas a APIs Java/Android e namespaces mais referenciados.
+- Comparação estática de classe/nome dos métodos DEX `native` com exports JNI `Java_*`, sinalizando bibliotecas com `JNI_OnLoad`.
 - Detecção de chamadas DEX a `System.loadLibrary`, `System.load` e `Runtime.load`; strings no mesmo método são exibidas como candidatas e não como argumento comprovado.
 - Recursos de hardware (`uses-feature`) e bibliotecas Android nativas declaradas no manifesto.
 - Bibliotecas `.so` em `lib/<abi>/`, dependências `NEEDED` e agrupamento de imports de APIs Android/NDK.
@@ -56,7 +57,9 @@ Esta etapa **não inicia o app**: ainda faltam carregador compatível com Bionic
 - Imports/exports ELF e indicadores JNI como `JNI_OnLoad` e exports `Java_*`.
 - Com `--symbols`, tentativa de decodificar nomes de classe/método dos exports JNI convencionais.
 
-Limites de análise: 512 MiB por biblioteca, 256 MiB por DEX e 16 MiB para o manifesto. A varredura DEX percorre instruções `invoke-*`, mas ainda não interpreta fluxo de dados, reflexão, chamadas customizadas, código carregado dinamicamente ou caminhos condicionais. As strings apresentadas perto de uma chamada de carregamento são pistas no método, não prova do valor passado. Os métodos `native` não são associados a `RegisterNatives` nem às bibliotecas que os implementam.
+Limites de análise: 512 MiB por biblioteca, 256 MiB por DEX e 16 MiB para o manifesto. A varredura DEX percorre instruções `invoke-*`, mas ainda não interpreta fluxo de dados, reflexão, chamadas customizadas, código carregado dinamicamente ou caminhos condicionais. As strings apresentadas perto de uma chamada de carregamento são pistas no método, não prova do valor passado. A associação DEX/JNI compara classe e nome do método com exports convencionais; não resolve sobrecargas pelo descritor completo e não descobre registros dinâmicos `RegisterNatives`. Um `JNI_OnLoad` é apenas um indicador de possível inicialização JNI, não prova que o método foi registrado.
+
+No APK atualmente analisado, a comparação encontrou correspondência convencional para 684 dos 733 métodos `native`; 49 não tiveram correspondência direta e três bibliotecas exportam `JNI_OnLoad`. Esses valores são resultados estáticos do APK e não confirmam quais métodos são chamados nem como os registros dinâmicos funcionam. Para ver associações por método e os exports, use `--symbols`.
 
 Este relatório estático é um mapa inicial das dependências visíveis, não uma lista completa de tudo que o runtime terá de implementar. Serviços solicitados em tempo de execução, comportamento de bibliotecas fechadas, recursos do dispositivo, autenticação e fluxos de rede não podem ser inferidos integralmente só do APK. A ferramenta não tenta contornar verificações de integridade, DRM ou autenticação.
 

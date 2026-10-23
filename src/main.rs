@@ -162,6 +162,45 @@ fn run() -> Result<()> {
         }
     }
 
+    let jni_links = jni::resolve_native_methods(&report.native_methods, &report.libraries);
+    println!(
+        "Associação JNI estática: {} métodos com export Java_* convencional; {} sem correspondência direta",
+        jni_links.conventional_matches, jni_links.without_conventional_match
+    );
+    if !jni_links.on_load_libraries.is_empty() {
+        println!(
+            "Bibliotecas com JNI_OnLoad (podem registrar métodos dinamicamente; não é prova de registro): {}",
+            jni_links.on_load_libraries.len()
+        );
+        if show_symbols {
+            for library in &jni_links.on_load_libraries {
+                println!("  - {library}");
+            }
+        }
+    }
+    if show_symbols {
+        println!("Associações de métodos nativos DEX:");
+        for method in &jni_links.methods {
+            if method.matching_exports.is_empty() {
+                println!(
+                    "  - {}.{} [{}]: sem export Java_* correspondente",
+                    method.class_name, method.method_name, method.dex_file
+                );
+            } else {
+                println!(
+                    "  - {}.{} [{}]: {}",
+                    method.class_name,
+                    method.method_name,
+                    method.dex_file,
+                    method.matching_exports.join(", ")
+                );
+            }
+        }
+        println!(
+            "Nota: a comparação usa classe e nome do método; não resolve sobrecargas por descritor JNI. Métodos sem export Java_* podem ser registrados via JNI_OnLoad, mas isso exige análise adicional."
+        );
+    }
+
     println!(
         "Bibliotecas nativas encontradas: {}",
         report.libraries.len()
