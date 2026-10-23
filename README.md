@@ -37,7 +37,7 @@ cargo run --release --bin prbx-runtime -- prepare "$HOME/Downloads/app.apk" --da
 
 Para `com.roblox.client`, o preparador cria `install/apk/base.apk`, `install/native/arm64-v8a/`, `install/assets/` e diretórios separados para `data/`, `data_de/`, `cache/`, `files/` e `storage/Delta/`. Os assets são extraídos preservando sua estrutura de subpastas, com limites de 256 MiB por arquivo, 2 GiB no total e 100.000 arquivos; caminhos absolutos, travessia de diretório e nomes incompatíveis com Windows são rejeitados. Atualizações são montadas em staging e substituem a instalação anterior somente depois da extração completa; dados, cache e armazenamento do app ficam fora dessa troca. Se a ativação falhar, a instalação anterior é restaurada.
 
-O preparador valida que cada biblioteca ARM64 é um ELF compatível e grava `install/native-dependencies-arm64-v8a.txt`. Esse inventário marca dependências fornecidas por outra `.so` do APK, dependências conhecidas da plataforma Android e dependências não classificadas. É uma resolução estática de `DT_NEEDED`, não prova que a biblioteca será carregada ou que a plataforma terá os símbolos/API necessários.
+O preparador valida que cada biblioteca ARM64 é um ELF compatível e grava `install/native-dependencies-arm64-v8a.txt`. Esse inventário marca dependências fornecidas por outra `.so` do APK, dependências conhecidas da plataforma Android e dependências não classificadas. Também grava `install/native-symbols-arm64-v8a.txt`, listando os símbolos dinâmicos indefinidos de cada biblioteca em grupos como EGL, OpenGL ES, JNI, C++ e POSIX threads. É uma leitura estática de `DT_NEEDED` e da tabela dinâmica; não prova que a biblioteca será carregada ou que a plataforma terá os símbolos/API necessários.
 
 O mapeador de caminhos reconhece `/storage/emulated/0`, `/storage/self/primary`, `/sdcard` e `/mnt/sdcard` como aliases do armazenamento compartilhado isolado. Também reconhece os dados privados em `/data/data/<pacote>`, `/data/user/0/<pacote>` e `/data/user_de/0/<pacote>`; cache e arquivos privados são direcionados aos diretórios `cache/` e `files/`, preferências e bancos permanecem em `data/`, e o caminho `user_de` vai para `data_de/`. Os diretórios específicos de outro pacote sob `Android/data`, `Android/obb` ou `Android/media` são recusados. Assim, `/storage/emulated/0/Delta` continua correspondendo a `<diretório-de-dados>/com.roblox.client/storage/Delta`, sem criar ou escrever em `/android` ou na raiz do host. Esse mapeador ainda é uma função de resolução lexical; a futura camada que abrir arquivos também deverá impor isolamento contra symlinks.
 
@@ -52,6 +52,7 @@ Esta etapa **não inicia o app**: ainda faltam carregador compatível com Bionic
 - Bibliotecas `.so` em `lib/<abi>/`, dependências `NEEDED` e agrupamento de imports de APIs Android/NDK.
 - Classe ELF, arquitetura, compatibilidade entre arquitetura e ABI, e dependências `NEEDED`.
 - Preparação valida ELF ARM64 e registra a classificação das dependências nativas do APK.
+- A preparação gera um inventário dos símbolos ELF importados, agrupados por biblioteca e família de API.
 - Imports/exports ELF e indicadores JNI como `JNI_OnLoad` e exports `Java_*`.
 - Com `--symbols`, tentativa de decodificar nomes de classe/método dos exports JNI convencionais.
 

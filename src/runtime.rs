@@ -44,9 +44,11 @@ pub struct PreparedApp {
     pub asset_bytes: u64,
     pub shared_storage: PathBuf,
     pub dependency_report: PathBuf,
+    pub symbol_report: PathBuf,
     pub packaged_dependencies: usize,
     pub android_dependencies: usize,
     pub unknown_dependencies: usize,
+    pub imported_symbols: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -60,6 +62,12 @@ struct NativeDependency {
     library: String,
     dependency: String,
     kind: DependencyKind,
+}
+
+struct NativeSymbol {
+    library: String,
+    group: &'static str,
+    symbol: String,
 }
 
 pub fn default_data_dir() -> Result<PathBuf> {
@@ -123,6 +131,8 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
     }
     let dependencies = native_dependencies(&target_libraries)?;
     let dependency_report = format!("native-dependencies-{TARGET_ABI}.txt");
+    let symbols = native_symbols(&target_libraries)?;
+    let symbol_report = format!("native-symbols-{TARGET_ABI}.txt");
     let packaged_dependencies = dependencies
         .iter()
         .filter(|dependency| dependency.kind == DependencyKind::Packaged)
@@ -159,6 +169,7 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
         )
     })?;
     write_dependency_report(&staged_install.join(&dependency_report), &dependencies)?;
+    write_symbol_report(&staged_install.join(&symbol_report), &symbols)?;
 
     let file = File::open(apk_path)
         .with_context(|| format!("não foi possível abrir {}", apk_path.display()))?;
@@ -245,10 +256,61 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
         asset_bytes,
         shared_storage,
         dependency_report: install_dir.join(&dependency_report),
+        symbol_report: install_dir.join(&symbol_report),
         packaged_dependencies,
         android_dependencies,
         unknown_dependencies,
+        imported_symbols: symbols.len(),
     })
+}
+
+fn native_symbols(libraries: &[&crate::apk::NativeLibrary]) -> Result<Vec<NativeSymbol>> {
+    let mut symbols = BTreeSet::new();
+    for library in libraries {
+        let file_name = Path::new(&library.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .with_context(|| format!("caminho de biblioteca inválido: {}", library.path))?;
+        let elf = library
+            .elf
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{}: {error}", library.path))?;
+        for symbol in &elf.imports {
+            symbols.insert((
+                file_name.to_owned(),
+                crate::elf::import_group(symbol),
+                symbol.clone(),
+            ));
+        }
+    }
+    Ok(symbols
+        .into_iter()
+        .map(|(library, group, symbol)| NativeSymbol {
+            library,
+            group,
+            symbol,
+        })
+        .collect())
+}
+
+fn write_symbol_report(path: &Path, symbols: &[NativeSymbol]) -> Result<()> {
+    use std::fmt::Write as _;
+
+    let mut report = String::from(
+        "Símbolos dinâmicos indefinidos observados estaticamente nas bibliotecas do APK.\n\
+Eles são requisitos de resolução ELF; não indicam por si só chamadas executadas nem APIs ausentes no host.\n",
+    );
+    let mut current_library = "";
+    for symbol in symbols {
+        if symbol.library != current_library {
+            current_library = &symbol.library;
+            writeln!(report, "\n[{}]", symbol.library).expect("escrever em String não falha");
+        }
+        writeln!(report, "{} | {}", symbol.group, symbol.symbol)
+            .expect("escrever em String não falha");
+    }
+    fs::write(path, report)
+        .with_context(|| format!("não foi possível gravar o relatório {}", path.display()))
 }
 
 fn native_dependencies(libraries: &[&crate::apk::NativeLibrary]) -> Result<Vec<NativeDependency>> {
@@ -774,6 +836,35 @@ mod tests {
                 .filter(|dependency| dependency.kind == DependencyKind::Unknown)
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn inventories_unique_undefined_symbols_by_native_library() {
+        let mut library = native_library("lib/arm64-v8a/libroblox.so", &[]);
+        library.elf.as_mut().unwrap().imports = vec![
+            "eglInitialize".to_owned(),
+            "JNI_OnLoad".to_owned(),
+            "eglInitialize".to_owned(),
+            "__cxa_throw".to_owned(),
+        ];
+
+        let symbols = native_symbols(&[&library]).unwrap();
+        assert_eq!(symbols.len(), 3);
+        assert!(
+            symbols
+                .iter()
+                .any(|symbol| symbol.group == "EGL" && symbol.symbol == "eglInitialize")
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|symbol| symbol.group == "JNI" && symbol.symbol == "JNI_OnLoad")
+        );
+        assert!(
+            symbols
+                .iter()
+                .all(|symbol| symbol.library == "libroblox.so")
         );
     }
 

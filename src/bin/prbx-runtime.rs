@@ -57,6 +57,11 @@ fn run() -> Result<()> {
         prepared.dependency_report.display()
     );
     println!(
+        "Símbolos nativos importados: {} (inventário em {})",
+        prepared.imported_symbols,
+        prepared.symbol_report.display()
+    );
+    println!(
         "Dependências ELF: {} no APK, {} de plataforma Android, {} não classificadas",
         prepared.packaged_dependencies,
         prepared.android_dependencies,

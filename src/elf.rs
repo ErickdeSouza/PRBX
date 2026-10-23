@@ -65,11 +65,11 @@ fn android_api_group(symbol: &str) -> Option<&'static str> {
         Some("Assets/configuration NDK")
     } else if symbol.starts_with("ALooper_") || symbol.starts_with("AChoreographer_") {
         Some("Looper/frame callbacks")
-    } else if symbol.starts_with("egl") {
+    } else if has_lowercase_api_prefix(symbol, "egl") {
         Some("EGL")
-    } else if symbol.starts_with("gl") {
+    } else if has_lowercase_api_prefix(symbol, "gl") {
         Some("OpenGL ES")
-    } else if symbol.starts_with("SL") || symbol.starts_with("sl") {
+    } else if symbol.starts_with("SL") || has_lowercase_api_prefix(symbol, "sl") {
         Some("OpenSL ES")
     } else if symbol.starts_with("A")
         && symbol.as_bytes().get(1).is_some_and(u8::is_ascii_uppercase)
@@ -77,6 +77,28 @@ fn android_api_group(symbol: &str) -> Option<&'static str> {
         Some("Other Android NDK")
     } else {
         None
+    }
+}
+
+fn has_lowercase_api_prefix(symbol: &str, prefix: &str) -> bool {
+    symbol
+        .strip_prefix(prefix)
+        .and_then(|suffix| suffix.as_bytes().first())
+        .is_some_and(u8::is_ascii_uppercase)
+}
+
+pub fn import_group(symbol: &str) -> &'static str {
+    if let Some(group) = android_api_group(symbol) {
+        group
+    } else if symbol.starts_with("JNI_") || symbol.starts_with("Java_") {
+        "JNI"
+    } else if symbol.starts_with("__cxa") || symbol.starts_with("_Z") || symbol.starts_with("__gxx")
+    {
+        "C++ runtime"
+    } else if symbol.starts_with("pthread_") || symbol.starts_with("sem_") {
+        "POSIX threads"
+    } else {
+        "Other ELF imports"
     }
 }
 
@@ -120,12 +142,14 @@ mod tests {
 
     #[test]
     fn groups_android_native_import_families() {
-        assert_eq!(
-            android_api_group("ANativeWindow_fromSurface"),
-            Some("Native window")
-        );
-        assert_eq!(android_api_group("AMediaCodec_start"), Some("Media NDK"));
-        assert_eq!(android_api_group("eglInitialize"), Some("EGL"));
-        assert_eq!(android_api_group("glViewport"), Some("OpenGL ES"));
+        assert_eq!(import_group("ANativeWindow_fromSurface"), "Native window");
+        assert_eq!(import_group("AMediaCodec_start"), "Media NDK");
+        assert_eq!(import_group("eglInitialize"), "EGL");
+        assert_eq!(import_group("glViewport"), "OpenGL ES");
+        assert_eq!(import_group("sleep"), "Other ELF imports");
+        assert_eq!(import_group("JNI_OnLoad"), "JNI");
+        assert_eq!(import_group("__cxa_throw"), "C++ runtime");
+        assert_eq!(import_group("pthread_create"), "POSIX threads");
+        assert_eq!(import_group("arbitrary_symbol"), "Other ELF imports");
     }
 }
