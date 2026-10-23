@@ -517,6 +517,9 @@ fn write_load_plan_report(path: &Path, libraries: &[&crate::apk::NativeLibrary])
             plan.image_start, plan.image_end, plan.image_size, plan.page_size
         )
         .expect("escrever em String não falha");
+        if let Some(soname) = &elf.soname {
+            writeln!(report, "SONAME: {soname}").expect("escrever em String não falha");
+        }
         if elf.relocation_types.is_empty() {
             writeln!(report, "Relocations dinâmicas: nenhuma")
                 .expect("escrever em String não falha");
@@ -615,17 +618,7 @@ fn native_load_order(
         Ok(())
     }
 
-    let indices = libraries
-        .iter()
-        .enumerate()
-        .map(|(index, library)| {
-            let name = Path::new(&library.path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .with_context(|| format!("caminho ELF inválido: {}", library.path))?;
-            Ok((name.to_owned(), index))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
+    let indices = native_library_indices(libraries)?;
     let mut roots = Vec::new();
     if let Some(entry_library) = entry_library {
         let name = Path::new(entry_library)
@@ -660,17 +653,7 @@ fn packaged_symbol_scope(
     libraries: &[&crate::apk::NativeLibrary],
     images: &[(String, crate::elf::MappedElfImage)],
 ) -> Result<BTreeMap<String, u64>> {
-    let indices = libraries
-        .iter()
-        .enumerate()
-        .map(|(index, library)| {
-            let name = Path::new(&library.path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .with_context(|| format!("caminho ELF inválido: {}", library.path))?;
-            Ok((name.to_owned(), index))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
+    let indices = native_library_indices(libraries)?;
     let importer = libraries
         .get(importer_index)
         .context("índice da biblioteca importadora inválido")?;
@@ -732,15 +715,34 @@ fn packaged_symbol_scope(
     Ok(scope)
 }
 
-fn native_dependencies(libraries: &[&crate::apk::NativeLibrary]) -> Result<Vec<NativeDependency>> {
-    let mut packaged = BTreeSet::new();
-    for library in libraries {
+fn native_library_indices(
+    libraries: &[&crate::apk::NativeLibrary],
+) -> Result<BTreeMap<String, usize>> {
+    let mut indices = BTreeMap::new();
+    for (index, library) in libraries.iter().enumerate() {
+        let elf = library
+            .elf
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{}: {error}", library.path))?;
         let file_name = Path::new(&library.path)
             .file_name()
             .and_then(|name| name.to_str())
-            .with_context(|| format!("caminho de biblioteca inválido: {}", library.path))?;
-        packaged.insert(file_name.to_owned());
+            .with_context(|| format!("caminho ELF inválido: {}", library.path))?;
+        for name in std::iter::once(file_name).chain(elf.soname.as_deref()) {
+            if let Some(previous) = indices.insert(name.to_owned(), index)
+                && previous != index
+            {
+                bail!("identidade de biblioteca nativa ambígua: {name}");
+            }
+        }
     }
+    Ok(indices)
+}
+
+fn native_dependencies(libraries: &[&crate::apk::NativeLibrary]) -> Result<Vec<NativeDependency>> {
+    let packaged = native_library_indices(libraries)?
+        .into_keys()
+        .collect::<BTreeSet<_>>();
 
     let mut dependencies = BTreeMap::new();
     for library in libraries {
@@ -1136,6 +1138,7 @@ mod tests {
                 relocation_types: BTreeMap::new(),
                 relocations: Vec::new(),
                 dynamic_symbols: Vec::new(),
+                soname: None,
                 needed: needed.iter().map(|name| (*name).to_owned()).collect(),
                 imports: Vec::new(),
                 exports: Vec::new(),
@@ -1283,6 +1286,25 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn matches_packaged_libraries_by_soname_and_rejects_ambiguous_identities() {
+        let app = native_library("lib/arm64-v8a/libapp.so", &["libcomponent.so"]);
+        let mut component = native_library("lib/arm64-v8a/libcomponent-v2.so", &[]);
+        component.elf.as_mut().unwrap().soname = Some("libcomponent.so".to_owned());
+        let libraries = [&app, &component];
+
+        assert_eq!(
+            native_load_order(&libraries, Some("libapp.so")).unwrap(),
+            vec!["libcomponent-v2.so", "libapp.so"]
+        );
+        assert!(native_dependencies(&libraries).unwrap()[0].kind == DependencyKind::Packaged);
+
+        let mut duplicate = native_library("lib/arm64-v8a/libduplicate.so", &[]);
+        duplicate.elf.as_mut().unwrap().soname = Some("libcomponent.so".to_owned());
+        let ambiguous = [&app, &component, &duplicate];
+        assert!(native_library_indices(&ambiguous).is_err());
     }
 
     #[test]

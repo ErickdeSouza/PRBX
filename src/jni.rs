@@ -296,6 +296,7 @@ mod tests {
                 relocation_types: BTreeMap::new(),
                 relocations: Vec::new(),
                 dynamic_symbols: Vec::new(),
+                soname: None,
                 needed: Vec::new(),
                 imports: Vec::new(),
                 exports: exports.iter().map(|name| (*name).to_owned()).collect(),

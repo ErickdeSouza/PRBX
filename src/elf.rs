@@ -74,6 +74,7 @@ pub struct ElfReport {
     pub relocation_types: BTreeMap<String, usize>,
     pub relocations: Vec<ElfRelocation>,
     pub dynamic_symbols: Vec<ElfDynamicSymbol>,
+    pub soname: Option<String>,
     pub needed: Vec<String>,
     pub imports: Vec<String>,
     pub exports: Vec<String>,
@@ -213,6 +214,7 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
         relocation_types,
         relocations,
         dynamic_symbols,
+        soname: elf.soname.map(str::to_owned),
         needed: elf
             .libraries
             .iter()
@@ -652,6 +654,7 @@ mod tests {
             relocation_types: BTreeMap::new(),
             relocations: Vec::new(),
             dynamic_symbols: Vec::new(),
+            soname: None,
             needed: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
