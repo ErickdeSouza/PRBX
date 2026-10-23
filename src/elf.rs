@@ -2172,6 +2172,132 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_applies_real_page_permissions_and_relro_without_execute() {
+        use std::ffi::c_void;
+
+        const PAGE_READONLY: u32 = 0x02;
+        const PAGE_READWRITE: u32 = 0x04;
+        const PAGE_EXECUTE: u32 = 0x10;
+        const PAGE_EXECUTE_READ: u32 = 0x20;
+        const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+
+        #[repr(C)]
+        struct MemoryBasicInformation {
+            base_address: *mut c_void,
+            allocation_base: *mut c_void,
+            allocation_protect: u32,
+            partition_id: u16,
+            region_size: usize,
+            state: u32,
+            protect: u32,
+            kind: u32,
+        }
+
+        unsafe extern "system" {
+            fn VirtualQuery(
+                address: *const c_void,
+                information: *mut MemoryBasicInformation,
+                length: usize,
+            ) -> usize;
+        }
+
+        fn protection_at(address: u64) -> u32 {
+            let mut information = MemoryBasicInformation {
+                base_address: std::ptr::null_mut(),
+                allocation_base: std::ptr::null_mut(),
+                allocation_protect: 0,
+                partition_id: 0,
+                region_size: 0,
+                state: 0,
+                protect: 0,
+                kind: 0,
+            };
+            let result = unsafe {
+                VirtualQuery(
+                    address as usize as *const c_void,
+                    &mut information,
+                    std::mem::size_of::<MemoryBasicInformation>(),
+                )
+            };
+            assert_ne!(result, 0, "VirtualQuery falhou");
+            information.protect
+        }
+
+        let page = ELF_PAGE_SIZE;
+        let plan = ElfLoadPlan {
+            page_size: page,
+            image_start: 0x1000,
+            image_end: 0x4000,
+            image_size: page * 3,
+            segments: vec![
+                ElfLoadSegment {
+                    file_offset: 0,
+                    virtual_address: 0x1000,
+                    file_size: page,
+                    memory_size: page,
+                    alignment: page,
+                    mapped_start: 0x1000,
+                    mapped_end: 0x2000,
+                    readable: true,
+                    writable: false,
+                    executable: true,
+                },
+                ElfLoadSegment {
+                    file_offset: page,
+                    virtual_address: 0x2000,
+                    file_size: page,
+                    memory_size: page,
+                    alignment: page,
+                    mapped_start: 0x2000,
+                    mapped_end: 0x3000,
+                    readable: true,
+                    writable: true,
+                    executable: false,
+                },
+                ElfLoadSegment {
+                    file_offset: page * 2,
+                    virtual_address: 0x3000,
+                    file_size: page,
+                    memory_size: page,
+                    alignment: page,
+                    mapped_start: 0x3000,
+                    mapped_end: 0x4000,
+                    readable: true,
+                    writable: true,
+                    executable: false,
+                },
+            ],
+        };
+        let relro = [ElfRelroPlan {
+            virtual_address: 0x2000,
+            memory_size: page,
+            page_start: 0x2000,
+            page_end: 0x3000,
+        }];
+        let bytes = vec![0x5a; (page * 3) as usize];
+        let mut image = map_load_image(&bytes, &plan, page * 3).unwrap();
+        let base = image.base_address();
+        image
+            .apply_final_page_protections_without_execute(&plan, &relro)
+            .unwrap();
+
+        let first_page = protection_at(base) & 0xff;
+        let relro_page = protection_at(base + page) & 0xff;
+        let writable_page = protection_at(base + page * 2) & 0xff;
+        assert_eq!(first_page, PAGE_READONLY);
+        assert_eq!(relro_page, PAGE_READONLY);
+        assert_eq!(writable_page, PAGE_READWRITE);
+        assert!(
+            [first_page, relro_page, writable_page]
+                .iter()
+                .all(|protection| {
+                    ![PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE].contains(protection)
+                })
+        );
+    }
+
     #[test]
     fn applies_relr_relocations_using_implicit_addends_from_image_memory() {
         let plan = ElfLoadPlan {
