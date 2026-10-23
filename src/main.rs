@@ -139,6 +139,27 @@ fn run() -> Result<()> {
     for (namespace, count) in api_namespaces.iter().take(15) {
         println!("  - {namespace}: {count} classes");
     }
+    let android_framework_call_sites = report
+        .framework_calls
+        .iter()
+        .filter(|(method, _)| is_android_framework_call(method))
+        .map(|(_, count)| count)
+        .sum::<usize>();
+    let android_framework_methods = report
+        .framework_calls
+        .keys()
+        .filter(|method| is_android_framework_call(method))
+        .count();
+    println!(
+        "Chamadas ao framework Android (android.*): {android_framework_call_sites} call sites em {android_framework_methods} referências de método distintas"
+    );
+    println!(
+        "Chamadas ao framework Android mais frequentes (até {}):",
+        PRIORITIZED_FRAMEWORK_CALLS
+    );
+    for (method, count) in prioritized_android_framework_calls(&report.framework_calls) {
+        println!("  - {method} ({count} call sites)");
+    }
     println!(
         "Chamadas Java/Android mais frequentes (até {}):",
         PRIORITIZED_FRAMEWORK_CALLS
@@ -325,6 +346,25 @@ fn prioritized_framework_calls(calls: &BTreeMap<String, usize>) -> Vec<(&str, us
     prioritized
 }
 
+fn is_android_framework_call(method: &str) -> bool {
+    method.starts_with("Landroid/")
+}
+
+fn prioritized_android_framework_calls(calls: &BTreeMap<String, usize>) -> Vec<(&str, usize)> {
+    let mut prioritized = calls
+        .iter()
+        .filter(|(method, _)| is_android_framework_call(method))
+        .map(|(method, count)| (method.as_str(), *count))
+        .collect::<Vec<_>>();
+    prioritized.sort_by(|(left_method, left_count), (right_method, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_method.cmp(right_method))
+    });
+    prioritized.truncate(PRIORITIZED_FRAMEWORK_CALLS);
+    prioritized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +398,23 @@ mod tests {
         assert_eq!(prioritized.len(), PRIORITIZED_FRAMEWORK_CALLS);
         assert_eq!(prioritized[0].1, 24);
         assert_eq!(prioritized[19].1, 5);
+    }
+
+    #[test]
+    fn prioritizes_android_calls_without_java_library_methods() {
+        let calls = BTreeMap::from([
+            ("Ljava/lang/StringBuilder;->append".to_owned(), 100),
+            ("Landroid/view/View;->draw".to_owned(), 8),
+            ("Landroid/content/Context;->getSystemService".to_owned(), 12),
+            ("Landroidx/core/View;->draw".to_owned(), 50),
+        ]);
+
+        assert_eq!(
+            prioritized_android_framework_calls(&calls),
+            vec![
+                ("Landroid/content/Context;->getSystemService", 12),
+                ("Landroid/view/View;->draw", 8),
+            ]
+        );
     }
 }

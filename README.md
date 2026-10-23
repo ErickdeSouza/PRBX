@@ -50,6 +50,7 @@ Esta etapa **não inicia o app**: ainda faltam carregador compatível com Bionic
 - Decodificação do manifesto binário para pacote, classe `Application`, launcher, SDK mínimo/alvo, componentes, permissões, recursos e metadados.
 - Inventário de arquivos multidex, métodos com o modificador DEX `native`, chamadas a APIs Java/Android e namespaces mais referenciados.
 - Priorização das 20 referências de métodos Java/Android mais frequentes no DEX, para orientar o levantamento inicial das APIs necessárias; `--symbols` continua exibindo a listagem completa.
+- Contagem e priorização separadas das chamadas `android.*`, sem deixar APIs padrão de Java dominarem a lista de necessidades do framework Android.
 - Comparação estática de classe, nome e descritor de parâmetros dos métodos DEX `native` com exports JNI `Java_*`, sinalizando bibliotecas com `JNI_OnLoad`.
 - Detecção de chamadas DEX a `System.loadLibrary`, `System.load` e `Runtime.load`; resolve o argumento quando uma instrução `const-string` imediatamente anterior alimenta o registrador do argumento, mantendo strings restantes como candidatas.
 - Recursos de hardware (`uses-feature`) e bibliotecas Android nativas declaradas no manifesto.
