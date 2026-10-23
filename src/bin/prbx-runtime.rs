@@ -75,7 +75,7 @@ fn run() -> Result<()> {
         prepared.load_plan_report.display()
     );
     println!(
-        "Teste de imagem ELF em buffer: {}",
+        "Relocations ELF em memória (teste): {}",
         prepared.image_report.display()
     );
     println!(

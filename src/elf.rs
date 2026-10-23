@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
-use goblin::elf::{Elf, header, program_header, reloc};
-use std::collections::BTreeMap;
+use goblin::elf::{Elf, header, program_header, reloc, section_header, sym};
+use memmap2::{MmapMut, MmapOptions};
+use std::collections::{BTreeMap, BTreeSet};
 
 const ELF_PAGE_SIZE: u64 = 4096;
 
@@ -35,13 +36,30 @@ pub struct ElfRelocation {
     pub relocation_name: String,
     pub symbol_index: usize,
     pub symbol_name: Option<String>,
+    pub symbol_value: Option<u64>,
+    pub symbol_defined: bool,
+    pub symbol_absolute: bool,
+    pub symbol_weak: bool,
 }
 
-#[derive(Debug)]
-pub struct MaterializedElfImage {
-    pub bytes: Vec<u8>,
+#[derive(Clone, Debug)]
+pub struct ElfDynamicSymbol {
+    pub name: String,
+    pub value: u64,
+    pub defined: bool,
+    pub absolute: bool,
+    pub global: bool,
+    pub weak: bool,
+    pub visible: bool,
+}
+
+pub struct MappedElfImage {
+    mapping: MmapMut,
+    pub load_bias: u64,
     pub relative_relocations_applied: usize,
-    pub unresolved_relocations: usize,
+    pub symbol_relocations_applied: usize,
+    pub unresolved_relocation_count: usize,
+    pub unresolved_relocations: Vec<String>,
 }
 
 pub struct ElfReport {
@@ -55,6 +73,7 @@ pub struct ElfReport {
     pub load_plan: Option<ElfLoadPlan>,
     pub relocation_types: BTreeMap<String, usize>,
     pub relocations: Vec<ElfRelocation>,
+    pub dynamic_symbols: Vec<ElfDynamicSymbol>,
     pub needed: Vec<String>,
     pub imports: Vec<String>,
     pub exports: Vec<String>,
@@ -118,9 +137,8 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
         .chain(elf.dynrels.iter())
         .chain(elf.pltrelocs.iter())
         .map(|relocation| {
-            let symbol_name = elf
-                .dynsyms
-                .get(relocation.r_sym)
+            let symbol = elf.dynsyms.get(relocation.r_sym);
+            let symbol_name = symbol
                 .and_then(|symbol| elf.dynstrtab.get_at(symbol.st_name))
                 .filter(|name| !name.is_empty())
                 .map(str::to_owned);
@@ -131,6 +149,12 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
                 relocation_name: relocation_name(relocation.r_type),
                 symbol_index: relocation.r_sym,
                 symbol_name,
+                symbol_value: symbol.map(|symbol| symbol.st_value),
+                symbol_defined: symbol.is_some_and(|symbol| symbol.st_shndx != 0),
+                symbol_absolute: symbol
+                    .is_some_and(|symbol| symbol.st_shndx == section_header::SHN_ABS as usize),
+                symbol_weak: symbol
+                    .is_some_and(|symbol| sym::st_bind(symbol.st_info) == sym::STB_WEAK),
             }
         })
         .collect::<Vec<_>>();
@@ -142,6 +166,7 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
     }
     let mut imports = Vec::new();
     let mut exports = Vec::new();
+    let mut dynamic_symbols = Vec::new();
 
     for symbol in &elf.dynsyms {
         let Some(name) = elf.dynstrtab.get_at(symbol.st_name) else {
@@ -155,6 +180,18 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
         } else {
             exports.push(name.to_owned());
         }
+        dynamic_symbols.push(ElfDynamicSymbol {
+            name: name.to_owned(),
+            value: symbol.st_value,
+            defined: symbol.st_shndx != 0,
+            absolute: symbol.st_shndx == section_header::SHN_ABS as usize,
+            global: sym::st_bind(symbol.st_info) == sym::STB_GLOBAL,
+            weak: sym::st_bind(symbol.st_info) == sym::STB_WEAK,
+            visible: matches!(
+                sym::st_visibility(symbol.st_other),
+                sym::STV_DEFAULT | sym::STV_PROTECTED
+            ),
+        });
     }
 
     let mut android_api_imports = BTreeMap::new();
@@ -175,6 +212,7 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
         load_plan,
         relocation_types,
         relocations,
+        dynamic_symbols,
         needed: elf
             .libraries
             .iter()
@@ -186,23 +224,24 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
     })
 }
 
-pub fn materialize_load_image(
+pub fn map_load_image(
     file_bytes: &[u8],
     plan: &ElfLoadPlan,
-    load_bias: u64,
     max_image_size: u64,
-    relocations: &[ElfRelocation],
-) -> Result<MaterializedElfImage> {
+) -> Result<MappedElfImage> {
     if plan.image_size > max_image_size {
         anyhow::bail!("imagem ELF excede o limite de materialização de {max_image_size} bytes");
     }
     let image_size = usize::try_from(plan.image_size)
         .context("imagem ELF não cabe no espaço de endereçamento")?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(image_size)
-        .context("não foi possível reservar memória para a imagem ELF")?;
-    bytes.resize(image_size, 0);
+    let mut mapping = MmapOptions::new()
+        .len(image_size)
+        .map_anon()
+        .context("não foi possível mapear memória anônima para a imagem ELF")?;
+    let mapping_address = mapping.as_ptr() as usize as u64;
+    let load_bias = mapping_address
+        .checked_sub(plan.image_start)
+        .context("base mapeada não permite representar o load bias ELF")?;
 
     for segment in &plan.segments {
         let source_start =
@@ -223,42 +262,149 @@ pub fn materialize_load_image(
         let target_end = target_start
             .checked_add(source_end - source_start)
             .context("overflow no intervalo de memória ELF")?;
-        if source_end > file_bytes.len() || target_end > bytes.len() {
+        if source_end > file_bytes.len() || target_end > mapping.len() {
             anyhow::bail!("segmento PT_LOAD excede os limites do arquivo ou da imagem ELF");
         }
-        bytes[target_start..target_end].copy_from_slice(&file_bytes[source_start..source_end]);
+        mapping[target_start..target_end].copy_from_slice(&file_bytes[source_start..source_end]);
     }
 
-    let relative_relocations = relocations
-        .iter()
-        .filter(|relocation| relocation.relocation_type == reloc::R_AARCH64_RELATIVE)
-        .cloned()
-        .collect::<Vec<_>>();
-    for relocation in &relative_relocations {
-        let target_end = relocation
-            .offset
-            .checked_add(8)
-            .context("overflow no endereço alvo de R_AARCH64_RELATIVE")?;
-        if !plan.segments.iter().any(|segment| {
-            segment.writable
-                && relocation.offset >= segment.virtual_address
-                && target_end <= segment.virtual_address.saturating_add(segment.memory_size)
-        }) {
-            anyhow::bail!("alvo R_AARCH64_RELATIVE não pertence a um PT_LOAD gravável");
-        }
-    }
-    let relative_relocations_applied = apply_relative_relocations(
-        &mut bytes,
-        plan.image_start,
+    Ok(MappedElfImage {
+        mapping,
         load_bias,
-        &relative_relocations,
-    )?;
-
-    Ok(MaterializedElfImage {
-        bytes,
-        relative_relocations_applied,
-        unresolved_relocations: relocations.len() - relative_relocations_applied,
+        relative_relocations_applied: 0,
+        symbol_relocations_applied: 0,
+        unresolved_relocation_count: 0,
+        unresolved_relocations: Vec::new(),
     })
+}
+
+impl MappedElfImage {
+    pub fn base_address(&self) -> u64 {
+        self.mapping.as_ptr() as usize as u64
+    }
+
+    pub fn image_size(&self) -> usize {
+        self.mapping.len()
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.mapping
+    }
+
+    pub fn apply_relocations(
+        &mut self,
+        plan: &ElfLoadPlan,
+        relocations: &[ElfRelocation],
+        packaged_symbols: &BTreeMap<String, u64>,
+    ) -> Result<()> {
+        let mut writes = Vec::new();
+        let mut unresolved = BTreeSet::new();
+        let mut relative_count = 0;
+        let mut symbol_count = 0;
+        let mut unresolved_count = 0;
+
+        for relocation in relocations {
+            let value = match relocation.relocation_type {
+                reloc::R_AARCH64_NONE => continue,
+                reloc::R_AARCH64_RELATIVE => {
+                    if relocation.symbol_index != 0 {
+                        anyhow::bail!("R_AARCH64_RELATIVE deve usar índice de símbolo zero");
+                    }
+                    let addend = relocation
+                        .addend
+                        .context("R_AARCH64_RELATIVE exige addend explícito RELA")?;
+                    let value = i128::from(self.load_bias) + i128::from(addend);
+                    u64::try_from(value).context("resultado de R_AARCH64_RELATIVE excede u64")?
+                }
+                reloc::R_AARCH64_ABS64 | reloc::R_AARCH64_GLOB_DAT | reloc::R_AARCH64_JUMP_SLOT => {
+                    let Some(symbol_name) = relocation.symbol_name.as_deref() else {
+                        anyhow::bail!("{} requer um símbolo nomeado", relocation.relocation_name);
+                    };
+                    let symbol_address = if relocation.symbol_defined {
+                        let value = relocation
+                            .symbol_value
+                            .context("símbolo definido sem valor")?;
+                        if relocation.symbol_absolute {
+                            Some(value)
+                        } else {
+                            Some(
+                                self.load_bias
+                                    .checked_add(value)
+                                    .context("endereço de símbolo ELF excede u64")?,
+                            )
+                        }
+                    } else {
+                        packaged_symbols.get(symbol_name).copied()
+                    };
+                    let symbol_address = match symbol_address {
+                        Some(address) => address,
+                        None if relocation.symbol_weak => 0,
+                        None => {
+                            unresolved.insert(symbol_name.to_owned());
+                            unresolved_count += 1;
+                            continue;
+                        }
+                    };
+                    let addend = relocation.addend.unwrap_or(0);
+                    let value = i128::from(symbol_address) + i128::from(addend);
+                    u64::try_from(value).with_context(|| {
+                        format!("resultado de {} excede u64", relocation.relocation_name)
+                    })?
+                }
+                _ => {
+                    unresolved.insert(format!(
+                        "{} ({})",
+                        relocation.relocation_name,
+                        relocation.symbol_name.as_deref().unwrap_or("(sem símbolo)")
+                    ));
+                    unresolved_count += 1;
+                    continue;
+                }
+            };
+
+            let target_end = relocation
+                .offset
+                .checked_add(8)
+                .context("overflow no endereço alvo de relocation")?;
+            if !plan.segments.iter().any(|segment| {
+                segment.writable
+                    && relocation.offset >= segment.virtual_address
+                    && target_end <= segment.virtual_address.saturating_add(segment.memory_size)
+            }) {
+                anyhow::bail!(
+                    "alvo de {} não pertence a um PT_LOAD gravável",
+                    relocation.relocation_name
+                );
+            }
+            let relative_offset = relocation
+                .offset
+                .checked_sub(plan.image_start)
+                .context("offset de relocation antecede o início da imagem")?;
+            let start = usize::try_from(relative_offset)
+                .context("offset de relocation não cabe em usize")?;
+            let end = start
+                .checked_add(8)
+                .context("overflow no campo da relocation")?;
+            if end > self.mapping.len() {
+                anyhow::bail!("alvo de relocation excede a imagem mapeada");
+            }
+            writes.push((start, value));
+            if relocation.relocation_type == reloc::R_AARCH64_RELATIVE {
+                relative_count += 1;
+            } else {
+                symbol_count += 1;
+            }
+        }
+
+        for (start, value) in &writes {
+            self.mapping[*start..*start + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        self.relative_relocations_applied += relative_count;
+        self.symbol_relocations_applied += symbol_count;
+        self.unresolved_relocation_count = unresolved_count;
+        self.unresolved_relocations = unresolved.into_iter().collect();
+        Ok(())
+    }
 }
 
 pub fn apply_relative_relocations(
@@ -505,6 +651,7 @@ mod tests {
             }),
             relocation_types: BTreeMap::new(),
             relocations: Vec::new(),
+            dynamic_symbols: Vec::new(),
             needed: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
@@ -593,6 +740,10 @@ mod tests {
                 relocation_name: "R_AARCH64_RELATIVE".to_owned(),
                 symbol_index: 0,
                 symbol_name: None,
+                symbol_value: None,
+                symbol_defined: false,
+                symbol_absolute: false,
+                symbol_weak: false,
             },
             ElfRelocation {
                 offset: 0x1018,
@@ -601,6 +752,10 @@ mod tests {
                 relocation_name: "R_AARCH64_RELATIVE".to_owned(),
                 symbol_index: 0,
                 symbol_name: None,
+                symbol_value: None,
+                symbol_defined: false,
+                symbol_absolute: false,
+                symbol_weak: false,
             },
         ];
         let mut image = [0; 0x40];
@@ -628,6 +783,10 @@ mod tests {
             relocation_name: "R_AARCH64_RELATIVE".to_owned(),
             symbol_index: 0,
             symbol_name: None,
+            symbol_value: None,
+            symbol_defined: false,
+            symbol_absolute: false,
+            symbol_weak: false,
         };
         let mut image = [0; 16];
         let invalid = ElfRelocation {
@@ -691,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn materializes_load_segments_copies_file_data_zeros_bss_and_applies_relative_relocations() {
+    fn maps_load_segments_copies_file_data_zeros_bss_and_applies_relocations() {
         let file_bytes = [0xabu8; 0x80];
         let plan = ElfLoadPlan {
             page_size: ELF_PAGE_SIZE,
@@ -718,32 +877,43 @@ mod tests {
             relocation_name: "R_AARCH64_RELATIVE".to_owned(),
             symbol_index: 0,
             symbol_name: None,
+            symbol_value: None,
+            symbol_defined: false,
+            symbol_absolute: false,
+            symbol_weak: false,
         };
         let unresolved = ElfRelocation {
+            symbol_index: 1,
+            symbol_name: Some("external_symbol".to_owned()),
             relocation_type: reloc::R_AARCH64_JUMP_SLOT,
             relocation_name: "R_AARCH64_JUMP_SLOT".to_owned(),
             ..relative.clone()
         };
 
-        let image =
-            materialize_load_image(&file_bytes, &plan, 0x8000, 0x1000, &[relative, unresolved])
-                .unwrap();
+        let mut image = map_load_image(&file_bytes, &plan, 0x1000).unwrap();
+        let load_bias = image.load_bias;
+        image
+            .apply_relocations(&plan, &[relative, unresolved], &BTreeMap::new())
+            .unwrap();
 
-        assert_eq!(image.bytes.len(), 0x1000);
-        assert!(image.bytes[..0x100].iter().all(|byte| *byte == 0));
-        assert!(image.bytes[0x100..0x110].iter().all(|byte| *byte == 0xab));
+        assert_eq!(image.image_size(), 0x1000);
+        assert!(image.bytes()[..0x100].iter().all(|byte| *byte == 0));
+        assert!(image.bytes()[0x100..0x110].iter().all(|byte| *byte == 0xab));
         assert_eq!(
-            u64::from_le_bytes(image.bytes[0x110..0x118].try_into().unwrap()),
-            0x8030
+            u64::from_le_bytes(image.bytes()[0x110..0x118].try_into().unwrap()),
+            load_bias + 0x30
         );
-        assert!(image.bytes[0x118..0x120].iter().all(|byte| *byte == 0xab));
-        assert!(image.bytes[0x120..].iter().all(|byte| *byte == 0));
+        assert!(image.bytes()[0x118..0x120].iter().all(|byte| *byte == 0xab));
+        assert!(image.bytes()[0x120..].iter().all(|byte| *byte == 0));
         assert_eq!(image.relative_relocations_applied, 1);
-        assert_eq!(image.unresolved_relocations, 1);
+        assert_eq!(
+            image.unresolved_relocations,
+            vec!["external_symbol".to_owned()]
+        );
     }
 
     #[test]
-    fn materialization_rejects_oversized_images_and_out_of_bounds_segments() {
+    fn mapping_rejects_oversized_images_and_out_of_bounds_segments() {
         let plan = ElfLoadPlan {
             page_size: ELF_PAGE_SIZE,
             image_start: 0,
@@ -762,8 +932,142 @@ mod tests {
                 executable: false,
             }],
         };
-        assert!(materialize_load_image(&[0; 8], &plan, 0, 0x800, &[]).is_err());
-        assert!(materialize_load_image(&[0; 4], &plan, 0, 0x1000, &[]).is_err());
+        assert!(map_load_image(&[0; 8], &plan, 0x800).is_err());
+        assert!(map_load_image(&[0; 4], &plan, 0x1000).is_err());
+    }
+
+    #[test]
+    fn resolves_symbol_relocations_from_packaged_library_exports() {
+        let plan = ElfLoadPlan {
+            page_size: ELF_PAGE_SIZE,
+            image_start: 0x1000,
+            image_end: 0x2000,
+            image_size: 0x1000,
+            segments: vec![ElfLoadSegment {
+                file_offset: 0,
+                virtual_address: 0x1000,
+                file_size: 0x100,
+                memory_size: 0x100,
+                alignment: 1,
+                mapped_start: 0x1000,
+                mapped_end: 0x2000,
+                readable: true,
+                writable: true,
+                executable: false,
+            }],
+        };
+        let relocations = [
+            ElfRelocation {
+                offset: 0x1010,
+                addend: Some(8),
+                relocation_type: reloc::R_AARCH64_ABS64,
+                relocation_name: "R_AARCH64_ABS64".to_owned(),
+                symbol_index: 1,
+                symbol_name: Some("packaged_data".to_owned()),
+                symbol_value: None,
+                symbol_defined: false,
+                symbol_absolute: false,
+                symbol_weak: false,
+            },
+            ElfRelocation {
+                offset: 0x1018,
+                addend: Some(0),
+                relocation_type: reloc::R_AARCH64_GLOB_DAT,
+                relocation_name: "R_AARCH64_GLOB_DAT".to_owned(),
+                symbol_index: 2,
+                symbol_name: Some("packaged_global".to_owned()),
+                symbol_value: None,
+                symbol_defined: false,
+                symbol_absolute: false,
+                symbol_weak: false,
+            },
+            ElfRelocation {
+                offset: 0x1020,
+                addend: Some(0),
+                relocation_type: reloc::R_AARCH64_JUMP_SLOT,
+                relocation_name: "R_AARCH64_JUMP_SLOT".to_owned(),
+                symbol_index: 3,
+                symbol_name: Some("packaged_function".to_owned()),
+                symbol_value: None,
+                symbol_defined: false,
+                symbol_absolute: false,
+                symbol_weak: false,
+            },
+        ];
+        let symbols = BTreeMap::from([
+            ("packaged_data".to_owned(), 0x1111),
+            ("packaged_global".to_owned(), 0x2222),
+            ("packaged_function".to_owned(), 0x3333),
+        ]);
+        let mut image = map_load_image(&[0x5a; 0x100], &plan, 0x1000).unwrap();
+
+        image
+            .apply_relocations(&plan, &relocations, &symbols)
+            .unwrap();
+
+        for (offset, expected) in [(0x10, 0x1119), (0x18, 0x2222), (0x20, 0x3333)] {
+            assert_eq!(
+                u64::from_le_bytes(image.bytes()[offset..offset + 8].try_into().unwrap()),
+                expected
+            );
+        }
+        assert_eq!(image.symbol_relocations_applied, 3);
+        assert!(image.unresolved_relocations.is_empty());
+    }
+
+    #[test]
+    fn weak_missing_symbols_resolve_to_zero_but_strong_imports_remain_unresolved() {
+        let plan = ElfLoadPlan {
+            page_size: ELF_PAGE_SIZE,
+            image_start: 0,
+            image_end: ELF_PAGE_SIZE,
+            image_size: ELF_PAGE_SIZE,
+            segments: vec![ElfLoadSegment {
+                file_offset: 0,
+                virtual_address: 0,
+                file_size: 0x40,
+                memory_size: 0x40,
+                alignment: 1,
+                mapped_start: 0,
+                mapped_end: ELF_PAGE_SIZE,
+                readable: true,
+                writable: true,
+                executable: false,
+            }],
+        };
+        let weak = ElfRelocation {
+            offset: 8,
+            addend: Some(0),
+            relocation_type: reloc::R_AARCH64_GLOB_DAT,
+            relocation_name: "R_AARCH64_GLOB_DAT".to_owned(),
+            symbol_index: 1,
+            symbol_name: Some("optional_api".to_owned()),
+            symbol_value: None,
+            symbol_defined: false,
+            symbol_absolute: false,
+            symbol_weak: true,
+        };
+        let strong = ElfRelocation {
+            offset: 16,
+            symbol_name: Some("android_api_not_provided".to_owned()),
+            symbol_weak: false,
+            ..weak.clone()
+        };
+        let mut image = map_load_image(&[0; 0x40], &plan, ELF_PAGE_SIZE).unwrap();
+
+        image
+            .apply_relocations(&plan, &[weak, strong], &BTreeMap::new())
+            .unwrap();
+
+        assert_eq!(
+            u64::from_le_bytes(image.bytes()[8..16].try_into().unwrap()),
+            0
+        );
+        assert_eq!(image.symbol_relocations_applied, 1);
+        assert_eq!(
+            image.unresolved_relocations,
+            vec!["android_api_not_provided".to_owned()]
+        );
     }
 
     #[test]

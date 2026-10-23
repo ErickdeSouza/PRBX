@@ -209,7 +209,6 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
     let mut native_libraries = 0;
     let mut asset_bytes = 0_u64;
     let mut assets = 0;
-    let mut image_checks = Vec::new();
 
     for index in 0..archive.len() {
         let entry = archive
@@ -231,42 +230,12 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
             }
             let destination = native_dir.join(&file_name);
             extract_entry(entry, &destination, &file_name)?;
-            let library = target_libraries
+            if !target_libraries
                 .iter()
-                .find(|library| library.path == archive_path)
-                .with_context(|| {
-                    format!("não foi possível localizar a análise ELF de {archive_path}")
-                })?;
-            let elf = library
-                .elf
-                .as_ref()
-                .map_err(|error| anyhow::anyhow!("{}: {error}", library.path))?;
-            let plan = elf
-                .load_plan
-                .as_ref()
-                .with_context(|| format!("{} não tem plano de imagem ELF", library.path))?;
-            let native_bytes = fs::read(&destination)
-                .with_context(|| format!("não foi possível reler {}", destination.display()))?;
-            let image = crate::elf::materialize_load_image(
-                &native_bytes,
-                plan,
-                0,
-                MAX_LIBRARY_SIZE,
-                &elf.relocations,
-            )
-            .with_context(|| {
-                format!(
-                    "não foi possível montar a imagem de teste de {}",
-                    library.path
-                )
-            })?;
-            image_checks.push(format!(
-                "{}: {} bytes materializados; {} relocations RELATIVE aplicadas com base simulada zero; {} relocations restantes sem resolver",
-                file_name,
-                image.bytes.len(),
-                image.relative_relocations_applied,
-                image.unresolved_relocations
-            ));
+                .any(|library| library.path == archive_path)
+            {
+                bail!("não foi possível localizar a análise ELF de {archive_path}");
+            }
             native_libraries += 1;
             continue;
         }
@@ -306,6 +275,101 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
 
     if native_libraries == 0 {
         bail!("não foi possível extrair bibliotecas para a ABI {TARGET_ABI}");
+    }
+
+    let mut mapped_images = Vec::with_capacity(target_libraries.len());
+    let mut mapped_total_size = 0_u64;
+    for library in &target_libraries {
+        let file_name = Path::new(&library.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .with_context(|| format!("caminho de biblioteca inválido: {}", library.path))?;
+        let elf = library
+            .elf
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{}: {error}", library.path))?;
+        let plan = elf
+            .load_plan
+            .as_ref()
+            .with_context(|| format!("{} não tem plano de imagem ELF", library.path))?;
+        mapped_total_size = mapped_total_size
+            .checked_add(plan.image_size)
+            .context("overflow no tamanho total das imagens ELF mapeadas")?;
+        if mapped_total_size > MAX_TOTAL_LIBRARY_SIZE {
+            bail!(
+                "imagens ELF excedem o limite total de memória de {MAX_TOTAL_LIBRARY_SIZE} bytes"
+            );
+        }
+        let native_bytes = fs::read(native_dir.join(file_name))
+            .with_context(|| format!("não foi possível ler a biblioteca {file_name}"))?;
+        let image = crate::elf::map_load_image(&native_bytes, plan, MAX_LIBRARY_SIZE)
+            .with_context(|| format!("não foi possível mapear {}", library.path))?;
+        mapped_images.push((file_name.to_owned(), image));
+    }
+
+    let mut packaged_symbols = BTreeMap::new();
+    for (index, library) in target_libraries.iter().enumerate() {
+        let elf = library
+            .elf
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{}: {error}", library.path))?;
+        let load_bias = mapped_images[index].1.load_bias;
+        for symbol in &elf.dynamic_symbols {
+            if !symbol.defined || !symbol.visible || !(symbol.global || symbol.weak) {
+                continue;
+            }
+            let address = if symbol.absolute {
+                symbol.value
+            } else {
+                load_bias
+                    .checked_add(symbol.value)
+                    .with_context(|| format!("endereço ELF excedido para {}", symbol.name))?
+            };
+            match packaged_symbols.entry(symbol.name.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((address, symbol.weak));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry)
+                    if entry.get().1 && !symbol.weak =>
+                {
+                    entry.insert((address, false));
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+        }
+    }
+    let packaged_symbols = packaged_symbols
+        .into_iter()
+        .map(|(name, (address, _))| (name, address))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut image_checks = Vec::with_capacity(mapped_images.len());
+    for (index, (file_name, image)) in mapped_images.iter_mut().enumerate() {
+        let library = target_libraries[index];
+        let elf = library
+            .elf
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{}: {error}", library.path))?;
+        let plan = elf
+            .load_plan
+            .as_ref()
+            .with_context(|| format!("{} não tem plano de imagem ELF", library.path))?;
+        image
+            .apply_relocations(plan, &elf.relocations, &packaged_symbols)
+            .with_context(|| format!("falha ao aplicar relocations de {file_name}"))?;
+        image_checks.push(format!(
+            "{file_name}: {} bytes em mmap RW; {} RELATIVE e {} relocations com símbolos aplicadas; {} relocations pendentes; símbolos/tipos: {}{}",
+            image.image_size(),
+            image.relative_relocations_applied,
+            image.symbol_relocations_applied,
+            image.unresolved_relocation_count,
+            image.unresolved_relocations.len(),
+            if image.unresolved_relocations.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", image.unresolved_relocations.join(", "))
+            }
+        ));
     }
 
     write_image_check_report(&staged_install.join(&image_report), &image_checks)?;
@@ -493,7 +557,7 @@ fn write_load_plan_report(path: &Path, libraries: &[&crate::apk::NativeLibrary])
         }
         writeln!(
             report,
-            "R_AARCH64_RELATIVE: aplicador em buffer disponível; ainda não conectado a memória mapeada"
+            "R_AARCH64_RELATIVE: suportada; veja o relatório native-image-check"
         )
         .expect("escrever em String não falha");
         for (index, segment) in plan.segments.iter().enumerate() {
@@ -524,8 +588,8 @@ fn write_load_plan_report(path: &Path, libraries: &[&crate::apk::NativeLibrary])
 
 fn write_image_check_report(path: &Path, checks: &[String]) -> Result<()> {
     let mut report = String::from(
-        "Materialização em buffer e aplicação de R_AARCH64_RELATIVE com load bias zero, somente para teste.\n\
-As demais relocations não foram resolvidas; as imagens não são executáveis nem mapeadas no processo.\n",
+        "Imagens mapeadas em memória virtual RW durante prepare; relocations relativas e símbolos entre bibliotecas do APK tentados.\n\
+Mapeamentos são descartados ao terminar prepare, páginas não executáveis, símbolos Android não fornecidos continuam pendentes.\n",
     );
     for check in checks {
         report.push_str(check);
@@ -938,6 +1002,7 @@ mod tests {
                 }),
                 relocation_types: BTreeMap::new(),
                 relocations: Vec::new(),
+                dynamic_symbols: Vec::new(),
                 needed: needed.iter().map(|name| (*name).to_owned()).collect(),
                 imports: Vec::new(),
                 exports: Vec::new(),
