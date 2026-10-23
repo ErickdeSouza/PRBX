@@ -586,6 +586,14 @@ fn write_load_plan_report(path: &Path, libraries: &[&crate::apk::NativeLibrary])
             )
             .expect("escrever em String não falha");
         }
+        for relro in &elf.relro_plans {
+            writeln!(
+                report,
+                "PT_GNU_RELRO: vaddr=0x{:x} mem=0x{:x} páginas candidatas=0x{:x}..0x{:x}",
+                relro.virtual_address, relro.memory_size, relro.page_start, relro.page_end
+            )
+            .expect("escrever em String não falha");
+        }
         if elf.relocation_types.is_empty() {
             writeln!(report, "Relocations dinâmicas: nenhuma")
                 .expect("escrever em String não falha");
@@ -1256,6 +1264,7 @@ mod tests {
                 }),
                 init_plan: crate::elf::ElfInitPlan::default(),
                 tls_plan: None,
+                relro_plans: Vec::new(),
                 relocation_types: BTreeMap::new(),
                 relocations: Vec::new(),
                 dynamic_symbols: Vec::new(),

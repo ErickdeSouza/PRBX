@@ -299,6 +299,27 @@ fn run() -> Result<()> {
                     "  Relocations dinâmicas ARM64: {relocation_count} em {} tipos",
                     elf_report.relocation_types.len()
                 );
+                if let Some(tls) = &elf_report.tls_plan {
+                    println!(
+                        "  PT_TLS: vaddr=0x{:x}, file=0x{:x}+0x{:x}, memória=0x{:x}, alinhamento=0x{:x}",
+                        tls.virtual_address,
+                        tls.file_offset,
+                        tls.file_size,
+                        tls.memory_size,
+                        tls.alignment
+                    );
+                }
+                for relro in &elf_report.relro_plans {
+                    println!(
+                        "  PT_GNU_RELRO: vaddr=0x{:x}, memória=0x{:x}, páginas candidatas=0x{:x}..0x{:x}",
+                        relro.virtual_address, relro.memory_size, relro.page_start, relro.page_end
+                    );
+                }
+                if show_symbols {
+                    for (relocation, count) in &elf_report.relocation_types {
+                        println!("    {relocation}: {count}");
+                    }
+                }
                 if elf_report.needed.is_empty() {
                     println!("  NEEDED: nenhuma dependência declarada");
                 } else {

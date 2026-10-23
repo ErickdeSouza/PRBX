@@ -295,6 +295,7 @@ mod tests {
                 }),
                 init_plan: crate::elf::ElfInitPlan::default(),
                 tls_plan: None,
+                relro_plans: Vec::new(),
                 relocation_types: BTreeMap::new(),
                 relocations: Vec::new(),
                 dynamic_symbols: Vec::new(),

@@ -48,6 +48,14 @@ pub struct ElfTlsPlan {
     pub alignment: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct ElfRelroPlan {
+    pub virtual_address: u64,
+    pub memory_size: u64,
+    pub page_start: u64,
+    pub page_end: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ResolvedElfInitPlan {
     pub init_functions: Vec<u64>,
@@ -110,6 +118,7 @@ pub struct ElfReport {
     pub load_plan: Option<ElfLoadPlan>,
     pub init_plan: ElfInitPlan,
     pub tls_plan: Option<ElfTlsPlan>,
+    pub relro_plans: Vec<ElfRelroPlan>,
     pub relocation_types: BTreeMap<String, usize>,
     pub relocations: Vec<ElfRelocation>,
     pub dynamic_symbols: Vec<ElfDynamicSymbol>,
@@ -173,6 +182,7 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
     };
     let init_plan = parse_init_plan(bytes, &elf)?;
     let tls_plan = parse_tls_plan(bytes.len() as u64, &elf.program_headers)?;
+    let relro_plans = parse_relro_plans(bytes.len() as u64, &elf.program_headers)?;
     let symbol_versions = symbol_versions(&elf);
     let mut relocations = elf
         .dynrelas
@@ -273,6 +283,7 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
         load_plan,
         init_plan,
         tls_plan,
+        relro_plans,
         relocation_types,
         relocations,
         dynamic_symbols,
@@ -575,6 +586,87 @@ fn parse_tls_plan(
         memory_size: segment.p_memsz,
         alignment: segment.p_align,
     }))
+}
+
+fn parse_relro_plans(
+    file_size: u64,
+    program_headers: &[goblin::elf::ProgramHeader],
+) -> Result<Vec<ElfRelroPlan>> {
+    let mut plans = Vec::new();
+    for relro in program_headers
+        .iter()
+        .filter(|segment| segment.p_type == program_header::PT_GNU_RELRO)
+    {
+        if relro.p_filesz > relro.p_memsz {
+            anyhow::bail!("segmento PT_GNU_RELRO tem p_filesz maior que p_memsz");
+        }
+        let file_end = relro
+            .p_offset
+            .checked_add(relro.p_filesz)
+            .context("overflow no intervalo de arquivo PT_GNU_RELRO")?;
+        if file_end > file_size {
+            anyhow::bail!("segmento PT_GNU_RELRO excede o tamanho do ELF");
+        }
+        let virtual_end = relro
+            .p_vaddr
+            .checked_add(relro.p_memsz)
+            .context("overflow no intervalo virtual PT_GNU_RELRO")?;
+        let file_backed_by_load_segment = program_headers
+            .iter()
+            .filter(|segment| segment.p_type == program_header::PT_LOAD)
+            .any(|load| {
+                let Some(load_file_end) = load.p_offset.checked_add(load.p_filesz) else {
+                    return false;
+                };
+                let Some(load_virtual_file_end) = load.p_vaddr.checked_add(load.p_filesz) else {
+                    return false;
+                };
+                let Some(relro_file_virtual_end) = relro.p_vaddr.checked_add(relro.p_filesz) else {
+                    return false;
+                };
+                relro.p_offset >= load.p_offset
+                    && file_end <= load_file_end
+                    && relro.p_vaddr >= load.p_vaddr
+                    && relro_file_virtual_end <= load_virtual_file_end
+                    && relro.p_vaddr - load.p_vaddr == relro.p_offset - load.p_offset
+            });
+        if !file_backed_by_load_segment {
+            anyhow::bail!("dados de PT_GNU_RELRO não estão em um PT_LOAD compatível");
+        }
+        if relro.p_memsz == 0 {
+            continue;
+        }
+        let page_start = relro.p_vaddr & !(ELF_PAGE_SIZE - 1);
+        let page_end = align_up(virtual_end, ELF_PAGE_SIZE)?;
+        let Some(image_start) = program_headers
+            .iter()
+            .filter(|segment| segment.p_type == program_header::PT_LOAD)
+            .map(|segment| segment.p_vaddr & !(ELF_PAGE_SIZE - 1))
+            .min()
+        else {
+            anyhow::bail!("PT_GNU_RELRO não pode existir sem PT_LOAD");
+        };
+        let image_end = program_headers
+            .iter()
+            .filter(|segment| segment.p_type == program_header::PT_LOAD)
+            .filter_map(|segment| segment.p_vaddr.checked_add(segment.p_memsz))
+            .map(|end| align_up(end, ELF_PAGE_SIZE))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .context("PT_LOAD sem fim virtual válido")?;
+        if page_start < image_start || page_end > image_end {
+            anyhow::bail!("intervalo em páginas PT_GNU_RELRO excede a imagem mapeável");
+        }
+        plans.push(ElfRelroPlan {
+            virtual_address: relro.p_vaddr,
+            memory_size: relro.p_memsz,
+            page_start,
+            page_end,
+        });
+    }
+    plans.sort_by_key(|plan| (plan.page_start, plan.page_end));
+    Ok(plans)
 }
 
 fn parse_relr_relocations(
@@ -1258,6 +1350,7 @@ mod tests {
             }),
             init_plan: ElfInitPlan::default(),
             tls_plan: None,
+            relro_plans: Vec::new(),
             relocation_types: BTreeMap::new(),
             relocations: Vec::new(),
             dynamic_symbols: Vec::new(),
@@ -1456,6 +1549,46 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn validates_gnu_relro_ranges_and_page_rounding() {
+        let headers = [
+            goblin::elf::ProgramHeader {
+                p_type: program_header::PT_LOAD,
+                p_offset: 0,
+                p_vaddr: 0,
+                p_filesz: 0x3000,
+                p_memsz: 0x4000,
+                ..Default::default()
+            },
+            goblin::elf::ProgramHeader {
+                p_type: program_header::PT_GNU_RELRO,
+                p_offset: 0x1a0,
+                p_vaddr: 0x1a0,
+                p_filesz: 0x820,
+                p_memsz: 0x920,
+                ..Default::default()
+            },
+        ];
+        let plans = parse_relro_plans(0x3000, &headers).unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].virtual_address, 0x1a0);
+        assert_eq!(plans[0].memory_size, 0x920);
+        assert_eq!(plans[0].page_start, 0);
+        assert_eq!(plans[0].page_end, 0x1000);
+
+        let invalid = [
+            headers[0].clone(),
+            goblin::elf::ProgramHeader {
+                p_vaddr: 0x3f00,
+                p_offset: 0x3f00,
+                p_filesz: 0x100,
+                p_memsz: 0x200,
+                ..headers[1].clone()
+            },
+        ];
+        assert!(parse_relro_plans(0x4000, &invalid).is_err());
     }
 
     fn write_test_program_header(
