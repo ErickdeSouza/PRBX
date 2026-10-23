@@ -35,7 +35,7 @@ Em Linux, um teste com diretório explícito fica assim:
 cargo run --release --bin prbx-runtime -- prepare "$HOME/Downloads/app.apk" --data-dir "$HOME/.local/share/prbx/apps"
 ```
 
-Para `com.roblox.client`, o preparador cria `install/apk/base.apk`, `install/native/arm64-v8a/` e diretórios separados para `data/`, `cache/`, `files/` e `storage/Delta/`. O caminho Android `/storage/emulated/0/Delta` é mapeado para `<diretório-de-dados>/com.roblox.client/storage/Delta`. Essa árvore é isolada e não cria nem escreve em `/android` ou na raiz do host.
+Para `com.roblox.client`, o preparador cria `install/apk/base.apk`, `install/native/arm64-v8a/`, `install/assets/` e diretórios separados para `data/`, `cache/`, `files/` e `storage/Delta/`. Os assets são extraídos preservando sua estrutura de subpastas, com limites de 256 MiB por arquivo, 2 GiB no total e 100.000 arquivos; caminhos absolutos, travessia de diretório e nomes incompatíveis com Windows são rejeitados. Atualizações são montadas em staging e substituem a instalação anterior somente depois da extração completa; dados, cache e armazenamento do app ficam fora dessa troca. Se a ativação falhar, a instalação anterior é restaurada. O caminho Android `/storage/emulated/0/Delta` é mapeado para `<diretório-de-dados>/com.roblox.client/storage/Delta`. Essa árvore é isolada e não cria nem escreve em `/android` ou na raiz do host.
 
 Esta etapa **não inicia o app**: ainda faltam carregador compatível com Bionic, ART/JNI, APIs do framework Android, gráficos, áudio e mídia. O comando valida e extrai arquivos; não executa bibliotecas do APK.
 

@@ -49,6 +49,10 @@ fn run() -> Result<()> {
     println!("APK armazenado em: {}", prepared.apk_path.display());
     println!("Bibliotecas ARM64 extraídas: {}", prepared.native_libraries);
     println!(
+        "Assets extraídos: {} arquivos ({} bytes)",
+        prepared.assets, prepared.asset_bytes
+    );
+    println!(
         "/storage/emulated/0/Delta -> {}",
         prepared.shared_storage.join("Delta").display()
     );
