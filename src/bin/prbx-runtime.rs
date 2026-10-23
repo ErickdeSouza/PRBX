@@ -75,6 +75,10 @@ fn run() -> Result<()> {
         prepared.load_plan_report.display()
     );
     println!(
+        "Teste de imagem ELF em buffer: {}",
+        prepared.image_report.display()
+    );
+    println!(
         "Dependências ELF: {} no APK, {} de plataforma Android, {} não classificadas",
         prepared.packaged_dependencies,
         prepared.android_dependencies,

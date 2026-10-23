@@ -47,6 +47,7 @@ pub struct PreparedApp {
     pub dependency_report: PathBuf,
     pub symbol_report: PathBuf,
     pub load_plan_report: PathBuf,
+    pub image_report: PathBuf,
     pub packaged_dependencies: usize,
     pub android_dependencies: usize,
     pub unknown_dependencies: usize,
@@ -157,6 +158,7 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
     let symbols = native_symbols(&target_libraries)?;
     let symbol_report = format!("native-symbols-{TARGET_ABI}.txt");
     let load_plan_report = format!("native-load-plan-{TARGET_ABI}.txt");
+    let image_report = format!("native-image-check-{TARGET_ABI}.txt");
     let launch_config_file = "launch-config.json";
     let packaged_dependencies = dependencies
         .iter()
@@ -207,12 +209,14 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
     let mut native_libraries = 0;
     let mut asset_bytes = 0_u64;
     let mut assets = 0;
+    let mut image_checks = Vec::new();
 
     for index in 0..archive.len() {
         let entry = archive
             .by_index(index)
             .with_context(|| format!("não foi possível ler a entrada ZIP {index}"))?;
         if let Some(file_name) = library_file_name(entry.name(), TARGET_ABI).map(str::to_owned) {
+            let archive_path = entry.name().to_owned();
             if !seen_libraries.insert(file_name.clone()) {
                 bail!("o APK contém a biblioteca duplicada {file_name}");
             }
@@ -225,7 +229,44 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
             if total_size > MAX_TOTAL_LIBRARY_SIZE {
                 bail!("as bibliotecas excedem o limite total de {MAX_TOTAL_LIBRARY_SIZE} bytes");
             }
-            extract_entry(entry, &native_dir.join(&file_name), &file_name)?;
+            let destination = native_dir.join(&file_name);
+            extract_entry(entry, &destination, &file_name)?;
+            let library = target_libraries
+                .iter()
+                .find(|library| library.path == archive_path)
+                .with_context(|| {
+                    format!("não foi possível localizar a análise ELF de {archive_path}")
+                })?;
+            let elf = library
+                .elf
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("{}: {error}", library.path))?;
+            let plan = elf
+                .load_plan
+                .as_ref()
+                .with_context(|| format!("{} não tem plano de imagem ELF", library.path))?;
+            let native_bytes = fs::read(&destination)
+                .with_context(|| format!("não foi possível reler {}", destination.display()))?;
+            let image = crate::elf::materialize_load_image(
+                &native_bytes,
+                plan,
+                0,
+                MAX_LIBRARY_SIZE,
+                &elf.relocations,
+            )
+            .with_context(|| {
+                format!(
+                    "não foi possível montar a imagem de teste de {}",
+                    library.path
+                )
+            })?;
+            image_checks.push(format!(
+                "{}: {} bytes materializados; {} relocations RELATIVE aplicadas com base simulada zero; {} relocations restantes sem resolver",
+                file_name,
+                image.bytes.len(),
+                image.relative_relocations_applied,
+                image.unresolved_relocations
+            ));
             native_libraries += 1;
             continue;
         }
@@ -267,6 +308,7 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
         bail!("não foi possível extrair bibliotecas para a ABI {TARGET_ABI}");
     }
 
+    write_image_check_report(&staged_install.join(&image_report), &image_checks)?;
     fs::create_dir_all(app_root.join("data"))?;
     fs::create_dir_all(app_root.join("data_de"))?;
     fs::create_dir_all(app_root.join("cache"))?;
@@ -285,6 +327,7 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
         dependency_report: install_dir.join(&dependency_report),
         symbol_report: install_dir.join(&symbol_report),
         load_plan_report: install_dir.join(&load_plan_report),
+        image_report: install_dir.join(&image_report),
         packaged_dependencies,
         android_dependencies,
         unknown_dependencies,
@@ -474,6 +517,19 @@ fn write_load_plan_report(path: &Path, libraries: &[&crate::apk::NativeLibrary])
             )
             .expect("escrever em String não falha");
         }
+    }
+    fs::write(path, report)
+        .with_context(|| format!("não foi possível gravar o relatório {}", path.display()))
+}
+
+fn write_image_check_report(path: &Path, checks: &[String]) -> Result<()> {
+    let mut report = String::from(
+        "Materialização em buffer e aplicação de R_AARCH64_RELATIVE com load bias zero, somente para teste.\n\
+As demais relocations não foram resolvidas; as imagens não são executáveis nem mapeadas no processo.\n",
+    );
+    for check in checks {
+        report.push_str(check);
+        report.push('\n');
     }
     fs::write(path, report)
         .with_context(|| format!("não foi possível gravar o relatório {}", path.display()))

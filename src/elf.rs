@@ -37,6 +37,13 @@ pub struct ElfRelocation {
     pub symbol_name: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct MaterializedElfImage {
+    pub bytes: Vec<u8>,
+    pub relative_relocations_applied: usize,
+    pub unresolved_relocations: usize,
+}
+
 pub struct ElfReport {
     pub class: &'static str,
     pub machine: &'static str,
@@ -176,6 +183,81 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
         imports,
         exports,
         android_api_imports,
+    })
+}
+
+pub fn materialize_load_image(
+    file_bytes: &[u8],
+    plan: &ElfLoadPlan,
+    load_bias: u64,
+    max_image_size: u64,
+    relocations: &[ElfRelocation],
+) -> Result<MaterializedElfImage> {
+    if plan.image_size > max_image_size {
+        anyhow::bail!("imagem ELF excede o limite de materialização de {max_image_size} bytes");
+    }
+    let image_size = usize::try_from(plan.image_size)
+        .context("imagem ELF não cabe no espaço de endereçamento")?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(image_size)
+        .context("não foi possível reservar memória para a imagem ELF")?;
+    bytes.resize(image_size, 0);
+
+    for segment in &plan.segments {
+        let source_start =
+            usize::try_from(segment.file_offset).context("offset ELF não cabe em usize")?;
+        let source_end = source_start
+            .checked_add(
+                usize::try_from(segment.file_size)
+                    .context("tamanho de segmento ELF não cabe em usize")?,
+            )
+            .context("overflow no intervalo de arquivo ELF")?;
+        let target_start = usize::try_from(
+            segment
+                .virtual_address
+                .checked_sub(plan.image_start)
+                .context("segmento ELF antecede o início da imagem")?,
+        )
+        .context("endereço virtual ELF não cabe em usize")?;
+        let target_end = target_start
+            .checked_add(source_end - source_start)
+            .context("overflow no intervalo de memória ELF")?;
+        if source_end > file_bytes.len() || target_end > bytes.len() {
+            anyhow::bail!("segmento PT_LOAD excede os limites do arquivo ou da imagem ELF");
+        }
+        bytes[target_start..target_end].copy_from_slice(&file_bytes[source_start..source_end]);
+    }
+
+    let relative_relocations = relocations
+        .iter()
+        .filter(|relocation| relocation.relocation_type == reloc::R_AARCH64_RELATIVE)
+        .cloned()
+        .collect::<Vec<_>>();
+    for relocation in &relative_relocations {
+        let target_end = relocation
+            .offset
+            .checked_add(8)
+            .context("overflow no endereço alvo de R_AARCH64_RELATIVE")?;
+        if !plan.segments.iter().any(|segment| {
+            segment.writable
+                && relocation.offset >= segment.virtual_address
+                && target_end <= segment.virtual_address.saturating_add(segment.memory_size)
+        }) {
+            anyhow::bail!("alvo R_AARCH64_RELATIVE não pertence a um PT_LOAD gravável");
+        }
+    }
+    let relative_relocations_applied = apply_relative_relocations(
+        &mut bytes,
+        plan.image_start,
+        load_bias,
+        &relative_relocations,
+    )?;
+
+    Ok(MaterializedElfImage {
+        bytes,
+        relative_relocations_applied,
+        unresolved_relocations: relocations.len() - relative_relocations_applied,
     })
 }
 
@@ -606,6 +688,82 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn materializes_load_segments_copies_file_data_zeros_bss_and_applies_relative_relocations() {
+        let file_bytes = [0xabu8; 0x80];
+        let plan = ElfLoadPlan {
+            page_size: ELF_PAGE_SIZE,
+            image_start: 0x1000,
+            image_end: 0x2000,
+            image_size: 0x1000,
+            segments: vec![ElfLoadSegment {
+                file_offset: 0x20,
+                virtual_address: 0x1100,
+                file_size: 0x20,
+                memory_size: 0x30,
+                alignment: 0x1000,
+                mapped_start: 0x1000,
+                mapped_end: 0x2000,
+                readable: true,
+                writable: true,
+                executable: false,
+            }],
+        };
+        let relative = ElfRelocation {
+            offset: 0x1110,
+            addend: Some(0x30),
+            relocation_type: reloc::R_AARCH64_RELATIVE,
+            relocation_name: "R_AARCH64_RELATIVE".to_owned(),
+            symbol_index: 0,
+            symbol_name: None,
+        };
+        let unresolved = ElfRelocation {
+            relocation_type: reloc::R_AARCH64_JUMP_SLOT,
+            relocation_name: "R_AARCH64_JUMP_SLOT".to_owned(),
+            ..relative.clone()
+        };
+
+        let image =
+            materialize_load_image(&file_bytes, &plan, 0x8000, 0x1000, &[relative, unresolved])
+                .unwrap();
+
+        assert_eq!(image.bytes.len(), 0x1000);
+        assert!(image.bytes[..0x100].iter().all(|byte| *byte == 0));
+        assert!(image.bytes[0x100..0x110].iter().all(|byte| *byte == 0xab));
+        assert_eq!(
+            u64::from_le_bytes(image.bytes[0x110..0x118].try_into().unwrap()),
+            0x8030
+        );
+        assert!(image.bytes[0x118..0x120].iter().all(|byte| *byte == 0xab));
+        assert!(image.bytes[0x120..].iter().all(|byte| *byte == 0));
+        assert_eq!(image.relative_relocations_applied, 1);
+        assert_eq!(image.unresolved_relocations, 1);
+    }
+
+    #[test]
+    fn materialization_rejects_oversized_images_and_out_of_bounds_segments() {
+        let plan = ElfLoadPlan {
+            page_size: ELF_PAGE_SIZE,
+            image_start: 0,
+            image_end: 0x1000,
+            image_size: 0x1000,
+            segments: vec![ElfLoadSegment {
+                file_offset: 0,
+                virtual_address: 0,
+                file_size: 8,
+                memory_size: 8,
+                alignment: 1,
+                mapped_start: 0,
+                mapped_end: 0x1000,
+                readable: true,
+                writable: false,
+                executable: false,
+            }],
+        };
+        assert!(materialize_load_image(&[0; 8], &plan, 0, 0x800, &[]).is_err());
+        assert!(materialize_load_image(&[0; 4], &plan, 0, 0x1000, &[]).is_err());
     }
 
     #[test]
