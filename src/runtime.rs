@@ -531,7 +531,7 @@ fn write_load_plan_report(path: &Path, libraries: &[&crate::apk::NativeLibrary])
         }
         writeln!(
             report,
-            "R_AARCH64_RELATIVE: suportada; veja o relatório native-image-check"
+            "Suporte dinâmico: RELATIVE, ABS64/32/16, PREL64/32/16, GLOB_DAT e JUMP_SLOT; veja native-image-check"
         )
         .expect("escrever em String não falha");
         for (index, segment) in plan.segments.iter().enumerate() {
