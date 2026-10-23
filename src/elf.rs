@@ -31,6 +31,20 @@ pub struct ElfLoadPlan {
     pub segments: Vec<ElfLoadSegment>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ElfInitPlan {
+    pub init: Option<u64>,
+    pub init_array: Option<(u64, u64)>,
+    pub fini: Option<u64>,
+    pub fini_array: Option<(u64, u64)>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ResolvedElfInitPlan {
+    pub init_functions: Vec<u64>,
+    pub fini_functions: Vec<u64>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ElfRelocation {
     pub offset: u64,
@@ -85,6 +99,7 @@ pub struct ElfReport {
     pub has_load_segment: bool,
     pub has_dynamic_segment: bool,
     pub load_plan: Option<ElfLoadPlan>,
+    pub init_plan: ElfInitPlan,
     pub relocation_types: BTreeMap<String, usize>,
     pub relocations: Vec<ElfRelocation>,
     pub dynamic_symbols: Vec<ElfDynamicSymbol>,
@@ -146,6 +161,7 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
     } else {
         Some(build_load_plan(bytes.len() as u64, &load_segments)?)
     };
+    let init_plan = parse_init_plan(bytes, &elf)?;
     let symbol_versions = symbol_versions(&elf);
     let mut relocations = elf
         .dynrelas
@@ -244,6 +260,7 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
         has_load_segment,
         has_dynamic_segment,
         load_plan,
+        init_plan,
         relocation_types,
         relocations,
         dynamic_symbols,
@@ -393,6 +410,98 @@ fn virtual_address_to_file_offset(
     anyhow::bail!("tabela DT_RELR não está contida em um PT_LOAD de arquivo")
 }
 
+fn dynamic_value(elf: &Elf<'_>, tag: u64) -> Result<Option<u64>> {
+    let mut value = None;
+    if let Some(dynamic) = &elf.dynamic {
+        for entry in &dynamic.dyns {
+            if entry.d_tag == tag && value.replace(entry.d_val).is_some() {
+                anyhow::bail!("entrada dinâmica duplicada: {tag}");
+            }
+        }
+    }
+    Ok(value)
+}
+
+fn validate_executable_address(
+    address: u64,
+    program_headers: &[goblin::elf::ProgramHeader],
+) -> Result<()> {
+    if address == 0 {
+        return Ok(());
+    }
+    if program_headers.iter().any(|segment| {
+        segment.p_type == program_header::PT_LOAD
+            && segment.p_flags & program_header::PF_X != 0
+            && address >= segment.p_vaddr
+            && address < segment.p_vaddr.saturating_add(segment.p_memsz)
+    }) {
+        return Ok(());
+    }
+    anyhow::bail!("função inicializadora/finalizadora não está em PT_LOAD executável")
+}
+
+fn dynamic_array(
+    elf: &Elf<'_>,
+    program_headers: &[goblin::elf::ProgramHeader],
+    file_size: usize,
+    address_tag: u64,
+    size_tag: u64,
+    pointer_size: u64,
+) -> Result<Option<(u64, u64)>> {
+    let address = dynamic_value(elf, address_tag)?;
+    let size = dynamic_value(elf, size_tag)?;
+    match (address, size) {
+        (None, None) => Ok(None),
+        (Some(address), Some(size)) => {
+            if size % pointer_size != 0 {
+                anyhow::bail!("array de inicializadores/finalizadores tem tamanho inválido");
+            }
+            if size > 0 {
+                if address == 0 {
+                    anyhow::bail!("array dinâmico não pode ter endereço zero");
+                }
+                virtual_address_to_file_offset(address, size, program_headers, file_size)?;
+            }
+            Ok(Some((address, size)))
+        }
+        _ => anyhow::bail!("endereço e tamanho do array dinâmico devem aparecer juntos"),
+    }
+}
+
+fn parse_init_plan(bytes: &[u8], elf: &Elf<'_>) -> Result<ElfInitPlan> {
+    let init = dynamic_value(elf, goblin::elf::dynamic::DT_INIT)?;
+    let fini = dynamic_value(elf, goblin::elf::dynamic::DT_FINI)?;
+    let pointer_size = match elf.header.e_ident[header::EI_CLASS] {
+        header::ELFCLASS32 => 4,
+        header::ELFCLASS64 => 8,
+        _ => anyhow::bail!("classe ELF inválida para plano de inicializadores"),
+    };
+    for address in init.into_iter().chain(fini) {
+        validate_executable_address(address, &elf.program_headers)?;
+    }
+
+    Ok(ElfInitPlan {
+        init: init.filter(|address| *address != 0),
+        init_array: dynamic_array(
+            elf,
+            &elf.program_headers,
+            bytes.len(),
+            goblin::elf::dynamic::DT_INIT_ARRAY,
+            goblin::elf::dynamic::DT_INIT_ARRAYSZ,
+            pointer_size,
+        )?,
+        fini: fini.filter(|address| *address != 0),
+        fini_array: dynamic_array(
+            elf,
+            &elf.program_headers,
+            bytes.len(),
+            goblin::elf::dynamic::DT_FINI_ARRAY,
+            goblin::elf::dynamic::DT_FINI_ARRAYSZ,
+            pointer_size,
+        )?,
+    })
+}
+
 fn parse_relr_relocations(
     bytes: &[u8],
     program_headers: &[goblin::elf::ProgramHeader],
@@ -426,6 +535,9 @@ fn parse_relr_relocations(
     }
     if size == 0 {
         return Ok(Vec::new());
+    }
+    if address == 0 {
+        anyhow::bail!("DT_RELR não pode apontar para endereço virtual zero");
     }
     let file_offset = virtual_address_to_file_offset(address, size, program_headers, bytes.len())?;
     let table_size = usize::try_from(size).context("tabela DT_RELR não cabe em usize")?;
@@ -524,6 +636,86 @@ impl MappedElfImage {
 
     pub fn bytes(&self) -> &[u8] {
         &self.mapping
+    }
+
+    pub fn resolve_init_functions(
+        &self,
+        load_plan: &ElfLoadPlan,
+        init_plan: &ElfInitPlan,
+    ) -> Result<ResolvedElfInitPlan> {
+        fn resolve_address(address: u64, load_bias: u64, load_plan: &ElfLoadPlan) -> Result<u64> {
+            let runtime_address = load_bias
+                .checked_add(address)
+                .context("endereço de inicializador excede u64")?;
+            if load_plan.segments.iter().any(|segment| {
+                segment.executable
+                    && address >= segment.virtual_address
+                    && address < segment.virtual_address.saturating_add(segment.memory_size)
+            }) {
+                Ok(runtime_address)
+            } else {
+                anyhow::bail!("inicializador ELF não aponta para PT_LOAD executável")
+            }
+        }
+
+        fn read_function_array(
+            image: &MappedElfImage,
+            load_plan: &ElfLoadPlan,
+            array: Option<(u64, u64)>,
+        ) -> Result<Vec<u64>> {
+            let Some((virtual_address, size)) = array else {
+                return Ok(Vec::new());
+            };
+            let start = usize::try_from(
+                virtual_address
+                    .checked_sub(load_plan.image_start)
+                    .context("array de inicializadores antecede a imagem ELF")?,
+            )
+            .context("offset do array de inicializadores não cabe em usize")?;
+            let length = usize::try_from(size)
+                .context("tamanho do array de inicializadores não cabe em usize")?;
+            let end = start
+                .checked_add(length)
+                .context("overflow no intervalo do array de inicializadores")?;
+            let bytes = image
+                .mapping
+                .get(start..end)
+                .context("array de inicializadores excede a imagem mapeada")?;
+            let mut functions = Vec::new();
+            for entry in bytes.chunks_exact(8) {
+                let address = u64::from_le_bytes(entry.try_into().expect("chunk tem oito bytes"));
+                if address == 0 {
+                    continue;
+                }
+                let executable = load_plan.segments.iter().any(|segment| {
+                    let start = image.load_bias.saturating_add(segment.virtual_address);
+                    let end = start.saturating_add(segment.memory_size);
+                    segment.executable && address >= start && address < end
+                });
+                if !executable {
+                    anyhow::bail!("array ELF contém função fora de PT_LOAD executável");
+                }
+                functions.push(address);
+            }
+            Ok(functions)
+        }
+
+        let mut init_functions = Vec::new();
+        if let Some(init) = init_plan.init {
+            init_functions.push(resolve_address(init, self.load_bias, load_plan)?);
+        }
+        init_functions.extend(read_function_array(self, load_plan, init_plan.init_array)?);
+
+        let mut fini_functions = read_function_array(self, load_plan, init_plan.fini_array)?;
+        fini_functions.reverse();
+        if let Some(fini) = init_plan.fini {
+            fini_functions.push(resolve_address(fini, self.load_bias, load_plan)?);
+        }
+
+        Ok(ResolvedElfInitPlan {
+            init_functions,
+            fini_functions,
+        })
     }
 
     pub fn apply_relocations(
@@ -989,6 +1181,7 @@ mod tests {
                 image_size: ELF_PAGE_SIZE,
                 segments: Vec::new(),
             }),
+            init_plan: ElfInitPlan::default(),
             relocation_types: BTreeMap::new(),
             relocations: Vec::new(),
             dynamic_symbols: Vec::new(),
@@ -1097,12 +1290,16 @@ mod tests {
         bytes[52..54].copy_from_slice(&64_u16.to_le_bytes());
         bytes[54..56].copy_from_slice(&56_u16.to_le_bytes());
         bytes[56..58].copy_from_slice(&2_u16.to_le_bytes());
-        write_test_program_header(&mut bytes, 64, 1, 6, 0, 0, 0x200, 0x200, 0x1000);
-        write_test_program_header(&mut bytes, 120, 2, 6, 0x100, 0x100, 64, 64, 8);
-        let dynamic_entries: [(u64, u64); 4] = [
+        write_test_program_header(&mut bytes, 64, 1, 7, 0, 0, 0x200, 0x200, 0x1000);
+        write_test_program_header(&mut bytes, 120, 2, 6, 0x100, 0x100, 128, 128, 8);
+        let dynamic_entries: [(u64, u64); 8] = [
             (DT_RELR_TAG, 0x180),
             (DT_RELRSZ_TAG, 16),
             (DT_RELRENT_TAG, 8),
+            (goblin::elf::dynamic::DT_INIT, 0x40),
+            (goblin::elf::dynamic::DT_INIT_ARRAY, 0x1c0),
+            (goblin::elf::dynamic::DT_INIT_ARRAYSZ, 16),
+            (goblin::elf::dynamic::DT_FINI, 0x48),
             (0, 0),
         ];
         for (index, (tag, value)) in dynamic_entries.into_iter().enumerate() {
@@ -1115,6 +1312,7 @@ mod tests {
 
         let elf = Elf::parse(&bytes).unwrap();
         let relr = parse_relr_relocations(&bytes, &elf.program_headers, &elf).unwrap();
+        let init_plan = parse_init_plan(&bytes, &elf).unwrap();
 
         assert_eq!(
             relr.iter()
@@ -1125,6 +1323,22 @@ mod tests {
         assert!(relr.iter().all(|relocation| {
             relocation.relocation_name == "R_AARCH64_RELATIVE_RELR" && relocation.addend.is_none()
         }));
+        assert_eq!(init_plan.init, Some(0x40));
+        assert_eq!(init_plan.init_array, Some((0x1c0, 16)));
+        assert_eq!(init_plan.fini, Some(0x48));
+        assert_eq!(init_plan.fini_array, None);
+
+        let mut invalid_init_address = bytes.clone();
+        invalid_init_address[0x100 + 3 * 16 + 8..0x100 + 4 * 16]
+            .copy_from_slice(&0x300_u64.to_le_bytes());
+        let invalid_init_elf = Elf::parse(&invalid_init_address).unwrap();
+        assert!(parse_init_plan(&invalid_init_address, &invalid_init_elf).is_err());
+
+        let mut invalid_array_size = bytes.clone();
+        invalid_array_size[0x100 + 5 * 16 + 8..0x100 + 6 * 16]
+            .copy_from_slice(&12_u64.to_le_bytes());
+        let invalid_array_elf = Elf::parse(&invalid_array_size).unwrap();
+        assert!(parse_init_plan(&invalid_array_size, &invalid_array_elf).is_err());
     }
 
     fn write_test_program_header(
@@ -1386,6 +1600,66 @@ mod tests {
             load_bias + 0x1234
         );
         assert_eq!(image.relative_relocations_applied, 1);
+    }
+
+    #[test]
+    fn resolves_initializer_and_finalizer_order_without_executing_functions() {
+        let plan = ElfLoadPlan {
+            page_size: ELF_PAGE_SIZE,
+            image_start: 0,
+            image_end: ELF_PAGE_SIZE,
+            image_size: ELF_PAGE_SIZE,
+            segments: vec![
+                ElfLoadSegment {
+                    file_offset: 0,
+                    virtual_address: 0,
+                    file_size: 0x100,
+                    memory_size: 0x100,
+                    alignment: 1,
+                    mapped_start: 0,
+                    mapped_end: ELF_PAGE_SIZE,
+                    readable: true,
+                    writable: false,
+                    executable: true,
+                },
+                ElfLoadSegment {
+                    file_offset: 0x100,
+                    virtual_address: 0x100,
+                    file_size: 0x100,
+                    memory_size: 0x100,
+                    alignment: 1,
+                    mapped_start: 0,
+                    mapped_end: ELF_PAGE_SIZE,
+                    readable: true,
+                    writable: true,
+                    executable: false,
+                },
+            ],
+        };
+        let mut image = map_load_image(&[0; 0x200], &plan, ELF_PAGE_SIZE).unwrap();
+        let bias = image.load_bias;
+        image.mapping[0x110..0x118].copy_from_slice(&(bias + 0x40).to_le_bytes());
+        image.mapping[0x118..0x120].copy_from_slice(&0_u64.to_le_bytes());
+        image.mapping[0x120..0x128].copy_from_slice(&(bias + 0x50).to_le_bytes());
+        image.mapping[0x130..0x138].copy_from_slice(&(bias + 0x60).to_le_bytes());
+        image.mapping[0x138..0x140].copy_from_slice(&(bias + 0x70).to_le_bytes());
+        let init_plan = ElfInitPlan {
+            init: Some(0x20),
+            init_array: Some((0x110, 24)),
+            fini: Some(0x80),
+            fini_array: Some((0x130, 16)),
+        };
+
+        let functions = image.resolve_init_functions(&plan, &init_plan).unwrap();
+
+        assert_eq!(
+            functions.init_functions,
+            vec![bias + 0x20, bias + 0x40, bias + 0x50]
+        );
+        assert_eq!(
+            functions.fini_functions,
+            vec![bias + 0x70, bias + 0x60, bias + 0x80]
+        );
     }
 
     #[test]

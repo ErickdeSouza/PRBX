@@ -293,6 +293,7 @@ mod tests {
                     image_size: 4096,
                     segments: Vec::new(),
                 }),
+                init_plan: crate::elf::ElfInitPlan::default(),
                 relocation_types: BTreeMap::new(),
                 relocations: Vec::new(),
                 dynamic_symbols: Vec::new(),

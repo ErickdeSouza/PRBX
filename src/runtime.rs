@@ -342,6 +342,50 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
             }
         ));
     }
+    let library_indices = native_library_indices(&target_libraries)?;
+    let mut init_sequences = Vec::new();
+    let mut fini_sequences = Vec::new();
+    for file_name in &load_order {
+        let index = *library_indices
+            .get(file_name)
+            .with_context(|| format!("biblioteca {file_name} ausente no plano ELF"))?;
+        let library = target_libraries[index];
+        let elf = library
+            .elf
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{}: {error}", library.path))?;
+        let plan = elf
+            .load_plan
+            .as_ref()
+            .with_context(|| format!("{} não tem plano de imagem ELF", library.path))?;
+        let image = &mapped_images[index].1;
+        let functions = image.resolve_init_functions(plan, &elf.init_plan)?;
+        let init_offsets = functions
+            .init_functions
+            .iter()
+            .map(|address| address - image.load_bias)
+            .map(|address| format!("0x{address:x}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let fini_offsets = functions
+            .fini_functions
+            .iter()
+            .map(|address| address - image.load_bias)
+            .map(|address| format!("0x{address:x}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        init_sequences.push(format!("{file_name}: [{init_offsets}]"));
+        fini_sequences.push(format!("{file_name}: [{fini_offsets}]"));
+    }
+    image_checks.push(format!(
+        "Sequência DT_INIT/DT_INIT_ARRAY em ordem de dependências (planejada, não executada): {}",
+        init_sequences.join(" -> ")
+    ));
+    fini_sequences.reverse();
+    image_checks.push(format!(
+        "Sequência DT_FINI_ARRAY/DT_FINI em ordem de descarregamento (planejada, não executada): {}",
+        fini_sequences.join(" -> ")
+    ));
 
     write_image_check_report(&staged_install.join(&image_report), &image_checks)?;
     fs::create_dir_all(app_root.join("data"))?;
@@ -519,6 +563,20 @@ fn write_load_plan_report(path: &Path, libraries: &[&crate::apk::NativeLibrary])
         .expect("escrever em String não falha");
         if let Some(soname) = &elf.soname {
             writeln!(report, "SONAME: {soname}").expect("escrever em String não falha");
+        }
+        if let Some(init) = elf.init_plan.init {
+            writeln!(report, "DT_INIT: 0x{init:x}").expect("escrever em String não falha");
+        }
+        if let Some((address, size)) = elf.init_plan.init_array {
+            writeln!(report, "DT_INIT_ARRAY: 0x{address:x} ({size} bytes)")
+                .expect("escrever em String não falha");
+        }
+        if let Some(fini) = elf.init_plan.fini {
+            writeln!(report, "DT_FINI: 0x{fini:x}").expect("escrever em String não falha");
+        }
+        if let Some((address, size)) = elf.init_plan.fini_array {
+            writeln!(report, "DT_FINI_ARRAY: 0x{address:x} ({size} bytes)")
+                .expect("escrever em String não falha");
         }
         if elf.relocation_types.is_empty() {
             writeln!(report, "Relocations dinâmicas: nenhuma")
@@ -1188,6 +1246,7 @@ mod tests {
                     image_size: 4096,
                     segments: Vec::new(),
                 }),
+                init_plan: crate::elf::ElfInitPlan::default(),
                 relocation_types: BTreeMap::new(),
                 relocations: Vec::new(),
                 dynamic_symbols: Vec::new(),
