@@ -687,6 +687,31 @@ fn write_load_plan_report(path: &Path, libraries: &[&crate::apk::NativeLibrary])
             )
             .expect("escrever em String não falha");
         }
+        writeln!(
+            report,
+            "Proteções por página após PT_GNU_RELRO (planejadas, ainda não aplicadas):"
+        )
+        .expect("escrever em String não falha");
+        for page in plan.post_relro_page_protection_plan(&elf.relro_plans)? {
+            let permissions = format!(
+                "{}{}{}",
+                if page.readable { 'r' } else { '-' },
+                if page.writable { 'w' } else { '-' },
+                if page.executable { 'x' } else { '-' }
+            );
+            writeln!(
+                report,
+                "  0x{:x}..0x{:x} {permissions}{}",
+                page.start,
+                page.end,
+                if page.writable && page.executable {
+                    " (W+X)"
+                } else {
+                    ""
+                }
+            )
+            .expect("escrever em String não falha");
+        }
     }
     fs::write(path, report)
         .with_context(|| format!("não foi possível gravar o relatório {}", path.display()))

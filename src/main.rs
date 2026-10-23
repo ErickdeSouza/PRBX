@@ -333,6 +333,22 @@ fn run() -> Result<()> {
                                 }
                             );
                         }
+                        println!("  Pós-PT_GNU_RELRO (planejado, não aplicado):");
+                        for page in plan.post_relro_page_protection_plan(&elf_report.relro_plans)? {
+                            println!(
+                                "    0x{:x}..0x{:x} {}{}{}{}",
+                                page.start,
+                                page.end,
+                                if page.readable { 'r' } else { '-' },
+                                if page.writable { 'w' } else { '-' },
+                                if page.executable { 'x' } else { '-' },
+                                if page.writable && page.executable {
+                                    " (W+X)"
+                                } else {
+                                    ""
+                                }
+                            );
+                        }
                     }
                     for (relocation, count) in &elf_report.relocation_types {
                         println!("    {relocation}: {count}");

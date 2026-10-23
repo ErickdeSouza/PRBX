@@ -203,6 +203,65 @@ impl ElfLoadPlan {
         }
         Ok(ranges)
     }
+
+    pub fn post_relro_page_protection_plan(
+        &self,
+        relro_plans: &[ElfRelroPlan],
+    ) -> Result<Vec<ElfPageProtection>> {
+        if self.page_size == 0 {
+            anyhow::bail!("tamanho de página inválido para plano de proteção RELRO");
+        }
+        let protections = self.page_protection_plan()?;
+        for relro in relro_plans {
+            if relro.page_start % self.page_size != 0
+                || relro.page_end % self.page_size != 0
+                || relro.page_start < self.image_start
+                || relro.page_end > self.image_end
+                || relro.page_start >= relro.page_end
+            {
+                anyhow::bail!("intervalo PT_GNU_RELRO inválido para plano de proteção final");
+            }
+        }
+
+        let mut final_protections: Vec<ElfPageProtection> = Vec::new();
+        for protection in protections {
+            let mut boundaries = vec![protection.start, protection.end];
+            for relro in relro_plans {
+                if relro.page_start > protection.start && relro.page_start < protection.end {
+                    boundaries.push(relro.page_start);
+                }
+                if relro.page_end > protection.start && relro.page_end < protection.end {
+                    boundaries.push(relro.page_end);
+                }
+            }
+            boundaries.sort_unstable();
+            boundaries.dedup();
+            for interval in boundaries.windows(2) {
+                let start = interval[0];
+                let end = interval[1];
+                let in_relro = relro_plans
+                    .iter()
+                    .any(|relro| start >= relro.page_start && end <= relro.page_end);
+                let mut page = protection.clone();
+                page.start = start;
+                page.end = end;
+                if in_relro {
+                    page.writable = false;
+                }
+                if let Some(previous) = final_protections.last_mut()
+                    && previous.end == page.start
+                    && previous.readable == page.readable
+                    && previous.writable == page.writable
+                    && previous.executable == page.executable
+                {
+                    previous.end = page.end;
+                } else {
+                    final_protections.push(page);
+                }
+            }
+        }
+        Ok(final_protections)
+    }
 }
 
 pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
@@ -1487,6 +1546,24 @@ mod tests {
                     executable: true,
                 },
             ]
+        );
+        let relro = [ElfRelroPlan {
+            virtual_address: 0x3000,
+            memory_size: 0x1000,
+            page_start: 0x3000,
+            page_end: 0x4000,
+        }];
+        let final_protections = plan.post_relro_page_protection_plan(&relro).unwrap();
+        assert!(final_protections[2].readable);
+        assert!(!final_protections[2].writable);
+        assert!(final_protections[2].executable);
+        assert!(
+            plan.post_relro_page_protection_plan(&[ElfRelroPlan {
+                page_start: 0x2001,
+                page_end: 0x3000,
+                ..relro[0].clone()
+            }])
+            .is_err()
         );
     }
 
