@@ -13,6 +13,70 @@ pub struct DexReport {
     pub framework_classes: BTreeSet<String>,
 }
 
+fn library_string_argument(
+    method: &MethodReference,
+    units: &[u16],
+    cursor: usize,
+    opcode: u8,
+    previous_const_string: Option<&(u16, String)>,
+) -> Result<Option<String>> {
+    if !is_library_load(method) {
+        return Ok(None);
+    }
+    let Some((string_register, value)) = previous_const_string else {
+        return Ok(None);
+    };
+
+    let argument_index = if method.class_name == "Ljava/lang/Runtime;" {
+        1
+    } else {
+        0
+    };
+    let registers = if (0x6e..=0x72).contains(&opcode) {
+        invoke_35c_registers(units, cursor)?
+    } else if (0x74..=0x78).contains(&opcode) {
+        invoke_3rc_registers(units, cursor)?
+    } else {
+        return Ok(None);
+    };
+    Ok((registers.get(argument_index) == Some(string_register)).then(|| value.clone()))
+}
+
+fn invoke_35c_registers(units: &[u16], cursor: usize) -> Result<Vec<u16>> {
+    let first = *units
+        .get(cursor)
+        .context("invoke DEX sem primeiro code unit")?;
+    let count = ((first >> 12) & 0x0f) as usize;
+    let packed = *units
+        .get(cursor + 2)
+        .context("invoke DEX sem registradores")?;
+    let registers = [
+        packed & 0x0f,
+        (packed >> 4) & 0x0f,
+        (packed >> 8) & 0x0f,
+        (packed >> 12) & 0x0f,
+        (first >> 8) & 0x0f,
+    ];
+    if count > registers.len() {
+        bail!("invoke DEX excede cinco registradores");
+    }
+    Ok(registers[..count].to_vec())
+}
+
+fn invoke_3rc_registers(units: &[u16], cursor: usize) -> Result<Vec<u16>> {
+    let first = *units.get(cursor).context("invoke/range DEX truncado")?;
+    let count = (first >> 8) as usize;
+    let start = *units
+        .get(cursor + 2)
+        .context("invoke/range DEX sem registrador inicial")?;
+    if count > u8::MAX as usize {
+        bail!("invoke/range DEX excede o limite de registradores");
+    }
+    Ok((0..count)
+        .map(|index| start.wrapping_add(index as u16))
+        .collect())
+}
+
 pub struct NativeMethod {
     pub class_name: String,
     pub method_name: String,
@@ -23,6 +87,7 @@ pub struct NativeMethod {
 pub struct LibraryLoad {
     pub caller: String,
     pub target: String,
+    pub string_argument: Option<String>,
     pub string_constants: Vec<String>,
     pub dex_file: String,
 }
@@ -31,6 +96,7 @@ struct MethodReference {
     class_name: String,
     method_name: String,
     parameter_descriptor: String,
+    string_argument: Option<String>,
 }
 
 pub fn parse(bytes: &[u8], dex_file: &str) -> Result<DexReport> {
@@ -125,6 +191,7 @@ pub fn parse(bytes: &[u8], dex_file: &str) -> Result<DexReport> {
                             pending_loads.push(LibraryLoad {
                                 caller: caller.clone(),
                                 target: format!("{}->{}", target.class_name, target.method_name),
+                                string_argument: target.string_argument,
                                 string_constants: code.string_constants.clone(),
                                 dex_file: dex_file.to_owned(),
                             });
@@ -166,6 +233,7 @@ fn scan_code(
 
     let mut method_calls = Vec::new();
     let mut string_constants = Vec::new();
+    let mut previous_const_string = None;
     let mut cursor = 0;
     while cursor < units.len() {
         let opcode = (units[cursor] & 0xff) as u8;
@@ -181,11 +249,20 @@ fn scan_code(
             let method = methods
                 .get(method_index)
                 .context("invoke DEX referencia método inexistente")?;
-            method_calls.push(MethodReference {
+            let mut reference = MethodReference {
                 class_name: method.class_name.clone(),
                 method_name: method.method_name.clone(),
                 parameter_descriptor: method.parameter_descriptor.clone(),
-            });
+                string_argument: None,
+            };
+            reference.string_argument = library_string_argument(
+                &reference,
+                &units,
+                cursor,
+                opcode,
+                previous_const_string.as_ref(),
+            )?;
+            method_calls.push(reference);
         } else if opcode == 0xfa || opcode == 0xfb {
             let method_index = *units
                 .get(cursor + 1)
@@ -198,8 +275,10 @@ fn scan_code(
                 class_name: method.class_name.clone(),
                 method_name: method.method_name.clone(),
                 parameter_descriptor: method.parameter_descriptor.clone(),
+                string_argument: None,
             });
         } else if opcode == 0x1a || opcode == 0x1b {
+            let destination = units[cursor] >> 8;
             let string_index = if opcode == 0x1a {
                 *units.get(cursor + 1).context("const-string DEX truncado")? as u32
             } else {
@@ -215,7 +294,11 @@ fn scan_code(
                 .get(string_index as usize)
                 .context("const-string DEX referencia string inexistente")?;
             string_constants.push(value.clone());
+            previous_const_string = Some((destination, value.clone()));
+            cursor += instruction_size;
+            continue;
         }
+        previous_const_string = None;
         cursor += instruction_size;
     }
 
@@ -309,7 +392,8 @@ fn is_framework_class(class_name: &str) -> bool {
 fn is_library_load(method: &MethodReference) -> bool {
     (method.class_name == "Ljava/lang/System;"
         && (method.method_name == "loadLibrary" || method.method_name == "load"))
-        || (method.class_name == "Ljava/lang/Runtime;" && method.method_name == "load")
+        || (method.class_name == "Ljava/lang/Runtime;"
+            && (method.method_name == "loadLibrary" || method.method_name == "load"))
 }
 
 fn read_strings(bytes: &[u8], count: u32, offset: u32) -> Result<Vec<String>> {
@@ -390,6 +474,7 @@ fn read_methods(
             class_name: class_name.clone(),
             method_name: method_name.clone(),
             parameter_descriptor,
+            string_argument: None,
         });
     }
     Ok(methods)
@@ -542,5 +627,98 @@ mod tests {
         )
         .unwrap();
         assert_eq!(prototypes, ["(ILjava/lang/String;)V"]);
+    }
+
+    #[test]
+    fn resolves_adjacent_const_string_for_static_load_library_argument() {
+        let mut bytes = vec![0_u8; 16 + 5 * 2];
+        bytes[12..16].copy_from_slice(&5_u32.to_le_bytes());
+        let units = [0x001a_u16, 0, 0x1071, 0, 0];
+        for (index, unit) in units.into_iter().enumerate() {
+            bytes[16 + index * 2..18 + index * 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        let methods = [MethodReference {
+            class_name: "Ljava/lang/System;".to_owned(),
+            method_name: "loadLibrary".to_owned(),
+            parameter_descriptor: "(Ljava/lang/String;)V".to_owned(),
+            string_argument: None,
+        }];
+        let scan = scan_code(&bytes, 0, &methods, &["roblox".to_owned()]).unwrap();
+
+        assert_eq!(
+            scan.method_calls[0].string_argument.as_deref(),
+            Some("roblox")
+        );
+    }
+
+    #[test]
+    fn resolves_loader_argument_in_invoke_range_form() {
+        let mut bytes = vec![0_u8; 16 + 5 * 2];
+        bytes[12..16].copy_from_slice(&5_u32.to_le_bytes());
+        let units = [0x001a_u16, 0, 0x0177, 0, 0];
+        for (index, unit) in units.into_iter().enumerate() {
+            bytes[16 + index * 2..18 + index * 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        let methods = [MethodReference {
+            class_name: "Ljava/lang/System;".to_owned(),
+            method_name: "loadLibrary".to_owned(),
+            parameter_descriptor: "(Ljava/lang/String;)V".to_owned(),
+            string_argument: None,
+        }];
+        let scan = scan_code(&bytes, 0, &methods, &["roblox".to_owned()]).unwrap();
+
+        assert_eq!(
+            scan.method_calls[0].string_argument.as_deref(),
+            Some("roblox")
+        );
+    }
+
+    #[test]
+    fn resolves_runtime_load_argument_after_instance_receiver() {
+        let mut bytes = vec![0_u8; 16 + 5 * 2];
+        bytes[12..16].copy_from_slice(&5_u32.to_le_bytes());
+        let units = [0x011a_u16, 0, 0x206e, 1, 0x0010];
+        for (index, unit) in units.into_iter().enumerate() {
+            bytes[16 + index * 2..18 + index * 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        let methods = [
+            MethodReference {
+                class_name: "Ljava/lang/System;".to_owned(),
+                method_name: "loadLibrary".to_owned(),
+                parameter_descriptor: "(Ljava/lang/String;)V".to_owned(),
+                string_argument: None,
+            },
+            MethodReference {
+                class_name: "Ljava/lang/Runtime;".to_owned(),
+                method_name: "load".to_owned(),
+                parameter_descriptor: "(Ljava/lang/String;)V".to_owned(),
+                string_argument: None,
+            },
+        ];
+        let scan = scan_code(&bytes, 0, &methods, &["/tmp/libnative.so".to_owned()]).unwrap();
+
+        assert_eq!(
+            scan.method_calls[0].string_argument.as_deref(),
+            Some("/tmp/libnative.so")
+        );
+    }
+
+    #[test]
+    fn does_not_treat_unrelated_method_string_as_loader_argument() {
+        let mut bytes = vec![0_u8; 16 + 6 * 2];
+        bytes[12..16].copy_from_slice(&6_u32.to_le_bytes());
+        let units = [0x001a_u16, 0, 0x0000, 0x1071, 0, 0];
+        for (index, unit) in units.into_iter().enumerate() {
+            bytes[16 + index * 2..18 + index * 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        let methods = [MethodReference {
+            class_name: "Ljava/lang/System;".to_owned(),
+            method_name: "loadLibrary".to_owned(),
+            parameter_descriptor: "(Ljava/lang/String;)V".to_owned(),
+            string_argument: None,
+        }];
+        let scan = scan_code(&bytes, 0, &methods, &["not_the_argument".to_owned()]).unwrap();
+
+        assert_eq!(scan.method_calls[0].string_argument, None);
     }
 }

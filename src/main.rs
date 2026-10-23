@@ -146,10 +146,30 @@ fn run() -> Result<()> {
             "  - {} chama {} [{}]",
             load.caller, load.target, load.dex_file
         );
-        if load.string_constants.is_empty() {
+        if let Some(argument) = &load.string_argument {
+            println!("    Argumento resolvido por padrão const-string/invoke: {argument}");
+            if load.target.ends_with("->loadLibrary") {
+                let expected_file = format!("lib{argument}.so");
+                let packaged = report.libraries.iter().find(|library| {
+                    library.abi == "arm64-v8a"
+                        && Path::new(&library.path)
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            == Some(expected_file.as_str())
+                });
+                match packaged {
+                    Some(library) => {
+                        println!("    Biblioteca correspondente no APK: {}", library.path)
+                    }
+                    None => println!(
+                        "    Nenhuma biblioteca correspondente encontrada no APK para {expected_file}"
+                    ),
+                }
+            }
+        } else if load.string_constants.is_empty() {
             println!("    (nenhuma string constante no método)");
         } else {
-            println!("    Strings no método (candidatas; não prova valor passado):");
+            println!("    Argumento não resolvido; strings no método são apenas candidatas:");
             for string in &load.string_constants {
                 println!("      - {string}");
             }
