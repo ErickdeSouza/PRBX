@@ -53,6 +53,16 @@ fn run() -> Result<()> {
         prepared.assets, prepared.asset_bytes
     );
     println!(
+        "Mapa de dependências: {}",
+        prepared.dependency_report.display()
+    );
+    println!(
+        "Dependências ELF: {} no APK, {} de plataforma Android, {} não classificadas",
+        prepared.packaged_dependencies,
+        prepared.android_dependencies,
+        prepared.unknown_dependencies
+    );
+    println!(
         "/storage/emulated/0/Delta -> {}",
         prepared.shared_storage.join("Delta").display()
     );

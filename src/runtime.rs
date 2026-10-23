@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env,
     fs::{self, File},
     io::{self, Read},
@@ -43,6 +43,23 @@ pub struct PreparedApp {
     pub assets: usize,
     pub asset_bytes: u64,
     pub shared_storage: PathBuf,
+    pub dependency_report: PathBuf,
+    pub packaged_dependencies: usize,
+    pub android_dependencies: usize,
+    pub unknown_dependencies: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DependencyKind {
+    Packaged,
+    AndroidPlatform,
+    Unknown,
+}
+
+struct NativeDependency {
+    library: String,
+    dependency: String,
+    kind: DependencyKind,
 }
 
 pub fn default_data_dir() -> Result<PathBuf> {
@@ -82,13 +99,42 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
         .context("o manifesto não informa o nome do pacote")?;
     validate_package_name(package)?;
 
-    if !report
+    let target_libraries = report
         .libraries
         .iter()
-        .any(|library| library.abi == TARGET_ABI)
-    {
+        .filter(|library| library.abi == TARGET_ABI)
+        .collect::<Vec<_>>();
+    if target_libraries.is_empty() {
         bail!("o APK não contém bibliotecas para a ABI {TARGET_ABI}");
     }
+    for library in &target_libraries {
+        let elf = library.elf.as_ref().map_err(|error| {
+            anyhow::anyhow!(
+                "não foi possível validar a biblioteca {}: {error}",
+                library.path
+            )
+        })?;
+        if !elf.abi_matches {
+            bail!(
+                "a arquitetura ELF de {} não corresponde à ABI {TARGET_ABI}",
+                library.path
+            );
+        }
+    }
+    let dependencies = native_dependencies(&target_libraries)?;
+    let dependency_report = format!("native-dependencies-{TARGET_ABI}.txt");
+    let packaged_dependencies = dependencies
+        .iter()
+        .filter(|dependency| dependency.kind == DependencyKind::Packaged)
+        .count();
+    let android_dependencies = dependencies
+        .iter()
+        .filter(|dependency| dependency.kind == DependencyKind::AndroidPlatform)
+        .count();
+    let unknown_dependencies = dependencies
+        .iter()
+        .filter(|dependency| dependency.kind == DependencyKind::Unknown)
+        .count();
 
     let app_root = data_dir.join(package);
     let install_dir = app_root.join("install");
@@ -112,6 +158,7 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
             staged_apk.display()
         )
     })?;
+    write_dependency_report(&staged_install.join(&dependency_report), &dependencies)?;
 
     let file = File::open(apk_path)
         .with_context(|| format!("não foi possível abrir {}", apk_path.display()))?;
@@ -197,7 +244,101 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
         assets,
         asset_bytes,
         shared_storage,
+        dependency_report: install_dir.join(&dependency_report),
+        packaged_dependencies,
+        android_dependencies,
+        unknown_dependencies,
     })
+}
+
+fn native_dependencies(libraries: &[&crate::apk::NativeLibrary]) -> Result<Vec<NativeDependency>> {
+    let mut packaged = BTreeSet::new();
+    for library in libraries {
+        let file_name = Path::new(&library.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .with_context(|| format!("caminho de biblioteca inválido: {}", library.path))?;
+        packaged.insert(file_name.to_owned());
+    }
+
+    let mut dependencies = BTreeMap::new();
+    for library in libraries {
+        let file_name = Path::new(&library.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .with_context(|| format!("caminho de biblioteca inválido: {}", library.path))?;
+        let elf = library
+            .elf
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{}: {error}", library.path))?;
+        for dependency in &elf.needed {
+            let kind = if packaged.contains(dependency) {
+                DependencyKind::Packaged
+            } else if is_android_platform_library(dependency) {
+                DependencyKind::AndroidPlatform
+            } else {
+                DependencyKind::Unknown
+            };
+            dependencies
+                .entry((file_name.to_owned(), dependency.clone()))
+                .or_insert(NativeDependency {
+                    library: file_name.to_owned(),
+                    dependency: dependency.clone(),
+                    kind,
+                });
+        }
+    }
+    Ok(dependencies.into_values().collect())
+}
+
+fn is_android_platform_library(name: &str) -> bool {
+    matches!(
+        name,
+        "libandroid.so"
+            | "libc.so"
+            | "libdl.so"
+            | "libEGL.so"
+            | "libGLESv1_CM.so"
+            | "libGLESv2.so"
+            | "libGLESv3.so"
+            | "libjnigraphics.so"
+            | "liblog.so"
+            | "libm.so"
+            | "libmediandk.so"
+            | "libnativewindow.so"
+            | "libOpenMAXAL.so"
+            | "libOpenSLES.so"
+            | "libvulkan.so"
+            | "libz.so"
+    )
+}
+
+fn write_dependency_report(path: &Path, dependencies: &[NativeDependency]) -> Result<()> {
+    let mut report = String::from(
+        "Dependências ELF observadas estaticamente; isto não confirma disponibilidade em runtime.\n",
+    );
+    for dependency in dependencies {
+        let (status, detail) = match dependency.kind {
+            DependencyKind::Packaged => ("NO APK", "biblioteca empacotada"),
+            DependencyKind::AndroidPlatform => (
+                "PLATAFORMA ANDROID",
+                "fornecida pela plataforma; runtime ainda necessário",
+            ),
+            DependencyKind::Unknown => (
+                "NÃO RESOLVIDA",
+                "não encontrada no APK nem na lista conhecida",
+            ),
+        };
+        use std::fmt::Write as _;
+        writeln!(
+            report,
+            "{} -> {} | {} ({detail})",
+            dependency.library, dependency.dependency, status
+        )
+        .expect("escrever em String não falha");
+    }
+    fs::write(path, report)
+        .with_context(|| format!("não foi possível gravar o relatório {}", path.display()))
 }
 
 fn create_staging_directory(app_root: &Path) -> Result<StagingDirectory> {
@@ -486,6 +627,26 @@ fn validate_package_name(package: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::elf::ElfReport;
+    use std::collections::BTreeMap;
+
+    fn native_library(path: &str, needed: &[&str]) -> crate::apk::NativeLibrary {
+        crate::apk::NativeLibrary {
+            path: path.to_owned(),
+            abi: TARGET_ABI.to_owned(),
+            size: 0,
+            compressed_size: 0,
+            elf: Ok(ElfReport {
+                class: "ELF64",
+                machine: "AArch64",
+                abi_matches: true,
+                needed: needed.iter().map(|name| (*name).to_owned()).collect(),
+                imports: Vec::new(),
+                exports: Vec::new(),
+                android_api_imports: BTreeMap::new(),
+            }),
+        }
+    }
 
     #[test]
     fn maps_shared_storage_and_private_data() {
@@ -575,6 +736,45 @@ mod tests {
         assert!(asset_relative_path("assets/folder\\..\\outside").is_err());
         assert!(asset_relative_path("assets/C:/outside").is_err());
         assert!(asset_relative_path("assets/folder//file").is_err());
+    }
+
+    #[test]
+    fn classifies_packaged_android_and_unknown_native_dependencies() {
+        let roblox = native_library(
+            "lib/arm64-v8a/libroblox.so",
+            &[
+                "libbacktrace-native.so",
+                "libandroid.so",
+                "libjnigraphics.so",
+                "libGLESv3.so",
+                "libmissing.so",
+            ],
+        );
+        let backtrace = native_library("lib/arm64-v8a/libbacktrace-native.so", &["liblog.so"]);
+        let libraries = [&roblox, &backtrace];
+
+        let dependencies = native_dependencies(&libraries).unwrap();
+        assert_eq!(
+            dependencies
+                .iter()
+                .filter(|dependency| dependency.kind == DependencyKind::Packaged)
+                .count(),
+            1
+        );
+        assert_eq!(
+            dependencies
+                .iter()
+                .filter(|dependency| dependency.kind == DependencyKind::AndroidPlatform)
+                .count(),
+            4
+        );
+        assert_eq!(
+            dependencies
+                .iter()
+                .filter(|dependency| dependency.kind == DependencyKind::Unknown)
+                .count(),
+            1
+        );
     }
 
     #[test]
