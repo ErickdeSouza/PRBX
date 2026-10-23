@@ -183,6 +183,7 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
     }
 
     fs::create_dir_all(app_root.join("data"))?;
+    fs::create_dir_all(app_root.join("data_de"))?;
     fs::create_dir_all(app_root.join("cache"))?;
     fs::create_dir_all(app_root.join("files"))?;
     fs::create_dir_all(shared_storage.join("Delta"))?;
@@ -337,44 +338,118 @@ fn asset_relative_path(path: &str) -> Result<Option<PathBuf>> {
 }
 
 pub fn map_android_path(app_root: &Path, android_path: &str) -> Result<PathBuf> {
-    const SHARED_STORAGE: &str = "/storage/emulated/0";
-    const PRIVATE_DATA: &str = "/data/data";
-
     let app_package = app_root
         .file_name()
         .and_then(|name| name.to_str())
         .context("o diretório do app não contém um nome de pacote válido")?;
-    let (base, relative) = if android_path == SHARED_STORAGE {
-        (app_root.join("storage"), "")
-    } else if let Some(relative) = android_path.strip_prefix("/storage/emulated/0/") {
-        (app_root.join("storage"), relative)
-    } else if android_path == PRIVATE_DATA {
-        (app_root.join("data"), "")
-    } else if let Some(relative) = android_path.strip_prefix("/data/data/") {
-        let (package, package_relative) = relative.split_once('/').unwrap_or((relative, ""));
-        if package != app_package {
-            bail!("caminho privado pertence a outro pacote Android: {android_path}");
-        }
-        (app_root.join("data"), package_relative)
-    } else {
-        bail!("caminho Android não mapeado: {android_path}");
-    };
-
-    if relative.split('/').any(|component| component == "..") {
-        bail!("caminho Android contém componente de travessia: {android_path}");
-    }
-
-    let mut mapped = base;
-    for component in relative
-        .split('/')
-        .filter(|component| !component.is_empty())
+    if !android_path.starts_with('/') || android_path.contains('\\') || android_path.contains('\0')
     {
-        if component == "." || component.contains('\\') {
-            bail!("caminho Android inválido: {android_path}");
-        }
-        mapped.push(component);
+        bail!("caminho Android inválido: {android_path}");
     }
-    Ok(mapped)
+
+    if let Some(relative) = strip_android_prefix(
+        android_path,
+        &[
+            "/storage/emulated/0",
+            "/storage/self/primary",
+            "/mnt/sdcard",
+            "/sdcard",
+        ],
+    ) {
+        let components = validate_android_components(relative, android_path)?;
+        validate_external_package_scope(&components, app_package, android_path)?;
+        return Ok(append_components(app_root.join("storage"), &components));
+    }
+
+    for (prefix, directory) in [
+        ("/data/data", "data"),
+        ("/data/user/0", "data"),
+        ("/data/user_de/0", "data_de"),
+    ] {
+        if let Some(relative) = strip_android_prefix(android_path, &[prefix]) {
+            let components = validate_android_components(relative, android_path)?;
+            let Some((package, package_components)) = components.split_first() else {
+                bail!("caminho Android privado não especifica o pacote: {android_path}");
+            };
+            if *package != app_package {
+                bail!("caminho privado pertence a outro pacote Android: {android_path}");
+            }
+            let (base, remaining) = if directory == "data" {
+                split_private_data_directory(app_root, package_components)
+            } else {
+                (app_root.join(directory), package_components)
+            };
+            return Ok(append_components(base, remaining));
+        }
+    }
+
+    bail!("caminho Android não mapeado: {android_path}")
+}
+
+fn strip_android_prefix<'a>(path: &'a str, prefixes: &[&str]) -> Option<&'a str> {
+    prefixes.iter().find_map(|prefix| {
+        if path == *prefix {
+            Some("")
+        } else {
+            path.strip_prefix(prefix)
+                .and_then(|suffix| suffix.strip_prefix('/'))
+        }
+    })
+}
+
+fn validate_android_components<'a>(relative: &'a str, original: &str) -> Result<Vec<&'a str>> {
+    if relative.is_empty() {
+        return Ok(Vec::new());
+    }
+    let components = relative
+        .trim_end_matches('/')
+        .split('/')
+        .collect::<Vec<_>>();
+    if components.iter().any(|component| {
+        component.is_empty() || *component == "." || *component == ".." || component.contains(':')
+    }) {
+        bail!("caminho Android contém componente inválido: {original}");
+    }
+    Ok(components)
+}
+
+fn validate_external_package_scope(
+    components: &[&str],
+    app_package: &str,
+    original: &str,
+) -> Result<()> {
+    if components.len() >= 3
+        && components[0] == "Android"
+        && matches!(components[1], "data" | "obb" | "media")
+        && components[2] != app_package
+    {
+        bail!("caminho externo pertence a outro pacote Android: {original}");
+    }
+    Ok(())
+}
+
+fn append_components(mut base: PathBuf, components: &[&str]) -> PathBuf {
+    for component in components {
+        base.push(component);
+    }
+    base
+}
+
+fn split_private_data_directory<'a>(
+    app_root: &Path,
+    components: &'a [&'a str],
+) -> (PathBuf, &'a [&'a str]) {
+    match components.split_first() {
+        Some((first, remaining)) if *first == "cache" => (app_root.join("cache"), remaining),
+        Some((first, remaining)) if *first == "files" => (app_root.join("files"), remaining),
+        Some((first, remaining)) if *first == "code_cache" => {
+            (app_root.join("cache").join("code_cache"), remaining)
+        }
+        Some((first, remaining)) if *first == "no_backup" => {
+            (app_root.join("data").join("no_backup"), remaining)
+        }
+        _ => (app_root.join("data"), components),
+    }
 }
 
 fn library_file_name<'a>(path: &'a str, abi: &str) -> Option<&'a str> {
@@ -415,13 +490,38 @@ mod tests {
     #[test]
     fn maps_shared_storage_and_private_data() {
         let root = Path::new("/home/test/.local/share/prbx/apps/com.example");
-        assert_eq!(
-            map_android_path(root, "/storage/emulated/0/Delta").unwrap(),
-            root.join("storage").join("Delta")
-        );
+        let expected_delta = root.join("storage").join("Delta");
+        for alias in [
+            "/storage/emulated/0/Delta",
+            "/storage/self/primary/Delta",
+            "/mnt/sdcard/Delta",
+            "/sdcard/Delta",
+        ] {
+            assert_eq!(map_android_path(root, alias).unwrap(), expected_delta);
+        }
         assert_eq!(
             map_android_path(root, "/data/data/com.example/files").unwrap(),
-            root.join("data").join("files")
+            root.join("files")
+        );
+        assert_eq!(
+            map_android_path(root, "/data/user/0/com.example/cache").unwrap(),
+            root.join("cache")
+        );
+        assert_eq!(
+            map_android_path(root, "/data/user/0/com.example/shared_prefs/settings.xml").unwrap(),
+            root.join("data").join("shared_prefs").join("settings.xml")
+        );
+        assert_eq!(
+            map_android_path(root, "/data/user_de/0/com.example/no_backup").unwrap(),
+            root.join("data_de").join("no_backup")
+        );
+        assert_eq!(
+            map_android_path(root, "/storage/emulated/0/Android/data/com.example/files").unwrap(),
+            root.join("storage")
+                .join("Android")
+                .join("data")
+                .join("com.example")
+                .join("files")
         );
     }
 
@@ -432,6 +532,15 @@ mod tests {
         assert!(map_android_path(root, "/storage/emulated/0/../secret").is_err());
         assert!(map_android_path(root, "/storage/emulated/0\\..\\secret").is_err());
         assert!(map_android_path(root, "/data/data/com.other/files").is_err());
+        assert!(map_android_path(root, "/data/user/0/com.example.evil/files").is_err());
+        assert!(map_android_path(root, "/data/user_de/0/com.other/files").is_err());
+        assert!(
+            map_android_path(root, "/storage/emulated/0/Android/data/com.other/files").is_err()
+        );
+        assert!(map_android_path(root, "storage/emulated/0/Delta").is_err());
+        assert!(map_android_path(root, "/storage/emulated/0//Delta").is_err());
+        assert!(map_android_path(root, "/storage/emulated/0/Delta/../secret").is_err());
+        assert!(map_android_path(root, "/storage/emulated/0/C:/Windows").is_err());
     }
 
     #[test]
