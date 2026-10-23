@@ -293,6 +293,7 @@ mod tests {
                     image_size: 4096,
                     segments: Vec::new(),
                 }),
+                relocation_types: BTreeMap::new(),
                 needed: Vec::new(),
                 imports: Vec::new(),
                 exports: exports.iter().map(|name| (*name).to_owned()).collect(),

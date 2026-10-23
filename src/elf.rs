@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use goblin::elf::{Elf, header, program_header};
+use goblin::elf::{Elf, header, program_header, reloc};
 use std::collections::BTreeMap;
 
 const ELF_PAGE_SIZE: u64 = 4096;
@@ -36,6 +36,7 @@ pub struct ElfReport {
     pub has_load_segment: bool,
     pub has_dynamic_segment: bool,
     pub load_plan: Option<ElfLoadPlan>,
+    pub relocation_types: BTreeMap<String, usize>,
     pub needed: Vec<String>,
     pub imports: Vec<String>,
     pub exports: Vec<String>,
@@ -93,6 +94,17 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
     } else {
         Some(build_load_plan(bytes.len() as u64, &load_segments)?)
     };
+    let mut relocation_types = BTreeMap::new();
+    for relocation in elf
+        .dynrelas
+        .iter()
+        .chain(elf.dynrels.iter())
+        .chain(elf.pltrelocs.iter())
+    {
+        *relocation_types
+            .entry(relocation_name(relocation.r_type))
+            .or_insert(0) += 1;
+    }
     let mut imports = Vec::new();
     let mut exports = Vec::new();
 
@@ -126,6 +138,7 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
         has_load_segment,
         has_dynamic_segment,
         load_plan,
+        relocation_types,
         needed: elf
             .libraries
             .iter()
@@ -135,6 +148,26 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
         exports,
         android_api_imports,
     })
+}
+
+fn relocation_name(relocation_type: u32) -> String {
+    let name = match relocation_type {
+        reloc::R_AARCH64_NONE => "R_AARCH64_NONE",
+        reloc::R_AARCH64_ABS64 => "R_AARCH64_ABS64",
+        reloc::R_AARCH64_ABS32 => "R_AARCH64_ABS32",
+        reloc::R_AARCH64_PREL64 => "R_AARCH64_PREL64",
+        reloc::R_AARCH64_PREL32 => "R_AARCH64_PREL32",
+        reloc::R_AARCH64_GLOB_DAT => "R_AARCH64_GLOB_DAT",
+        reloc::R_AARCH64_JUMP_SLOT => "R_AARCH64_JUMP_SLOT",
+        reloc::R_AARCH64_RELATIVE => "R_AARCH64_RELATIVE",
+        reloc::R_AARCH64_TLS_DTPMOD => "R_AARCH64_TLS_DTPMOD",
+        reloc::R_AARCH64_TLS_DTPREL => "R_AARCH64_TLS_DTPREL",
+        reloc::R_AARCH64_TLS_TPREL => "R_AARCH64_TLS_TPREL",
+        reloc::R_AARCH64_TLSDESC => "R_AARCH64_TLSDESC",
+        reloc::R_AARCH64_IRELATIVE => "R_AARCH64_IRELATIVE",
+        _ => return format!("R_AARCH64_UNKNOWN_{relocation_type}"),
+    };
+    name.to_owned()
 }
 
 fn build_load_plan(
@@ -317,6 +350,7 @@ mod tests {
                 image_size: ELF_PAGE_SIZE,
                 segments: Vec::new(),
             }),
+            relocation_types: BTreeMap::new(),
             needed: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
@@ -380,6 +414,19 @@ mod tests {
             build_load_plan(0x1000, &[(0x100, 0, 0x100, 0x100, 1, program_header::PF_R)]).is_err()
         );
         assert!(build_load_plan(0x1000, &[]).is_err());
+    }
+
+    #[test]
+    fn names_common_arm64_dynamic_relocations_and_preserves_unknown_types() {
+        assert_eq!(
+            relocation_name(reloc::R_AARCH64_RELATIVE),
+            "R_AARCH64_RELATIVE"
+        );
+        assert_eq!(
+            relocation_name(reloc::R_AARCH64_JUMP_SLOT),
+            "R_AARCH64_JUMP_SLOT"
+        );
+        assert_eq!(relocation_name(12345), "R_AARCH64_UNKNOWN_12345");
     }
 
     #[test]

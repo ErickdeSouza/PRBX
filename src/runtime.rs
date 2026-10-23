@@ -418,7 +418,7 @@ fn write_load_plan_report(path: &Path, libraries: &[&crate::apk::NativeLibrary])
     use std::fmt::Write as _;
 
     let mut report = String::from(
-        "Plano estrutural de mapeamento ELF por páginas; não reserva memória, aplica relocations nem executa código.\n",
+        "Plano estrutural de mapeamento ELF por páginas e inventário de relocations; não reserva memória, aplica relocations nem executa código.\n",
     );
     for library in libraries {
         let name = Path::new(&library.path)
@@ -439,6 +439,15 @@ fn write_load_plan_report(path: &Path, libraries: &[&crate::apk::NativeLibrary])
             plan.image_start, plan.image_end, plan.image_size, plan.page_size
         )
         .expect("escrever em String não falha");
+        if elf.relocation_types.is_empty() {
+            writeln!(report, "Relocations dinâmicas: nenhuma")
+                .expect("escrever em String não falha");
+        } else {
+            writeln!(report, "Relocations dinâmicas:").expect("escrever em String não falha");
+            for (relocation, count) in &elf.relocation_types {
+                writeln!(report, "  {relocation}: {count}").expect("escrever em String não falha");
+            }
+        }
         for (index, segment) in plan.segments.iter().enumerate() {
             let permissions = format!(
                 "{}{}{}",
@@ -866,6 +875,7 @@ mod tests {
                     image_size: 4096,
                     segments: Vec::new(),
                 }),
+                relocation_types: BTreeMap::new(),
                 needed: needed.iter().map(|name| (*name).to_owned()).collect(),
                 imports: Vec::new(),
                 exports: Vec::new(),

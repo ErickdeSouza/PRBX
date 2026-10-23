@@ -294,6 +294,11 @@ fn run() -> Result<()> {
                         "incompatível"
                     }
                 );
+                let relocation_count = elf_report.relocation_types.values().sum::<usize>();
+                println!(
+                    "  Relocations dinâmicas ARM64: {relocation_count} em {} tipos",
+                    elf_report.relocation_types.len()
+                );
                 if elf_report.needed.is_empty() {
                     println!("  NEEDED: nenhuma dependência declarada");
                 } else {
