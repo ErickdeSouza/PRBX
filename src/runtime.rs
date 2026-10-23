@@ -662,6 +662,31 @@ fn write_load_plan_report(path: &Path, libraries: &[&crate::apk::NativeLibrary])
             )
             .expect("escrever em String não falha");
         }
+        writeln!(
+            report,
+            "Proteções por página calculadas (ainda não aplicadas):"
+        )
+        .expect("escrever em String não falha");
+        for page in plan.page_protection_plan()? {
+            let permissions = format!(
+                "{}{}{}",
+                if page.readable { 'r' } else { '-' },
+                if page.writable { 'w' } else { '-' },
+                if page.executable { 'x' } else { '-' }
+            );
+            writeln!(
+                report,
+                "  0x{:x}..0x{:x} {permissions}{}",
+                page.start,
+                page.end,
+                if page.writable && page.executable {
+                    " (W+X)"
+                } else {
+                    ""
+                }
+            )
+            .expect("escrever em String não falha");
+        }
     }
     fs::write(path, report)
         .with_context(|| format!("não foi possível gravar o relatório {}", path.display()))

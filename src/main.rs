@@ -316,6 +316,24 @@ fn run() -> Result<()> {
                     );
                 }
                 if show_symbols {
+                    if let Some(plan) = &elf_report.load_plan {
+                        println!("  Proteções por página planejadas (não aplicadas):");
+                        for page in plan.page_protection_plan()? {
+                            println!(
+                                "    0x{:x}..0x{:x} {}{}{}{}",
+                                page.start,
+                                page.end,
+                                if page.readable { 'r' } else { '-' },
+                                if page.writable { 'w' } else { '-' },
+                                if page.executable { 'x' } else { '-' },
+                                if page.writable && page.executable {
+                                    " (W+X)"
+                                } else {
+                                    ""
+                                }
+                            );
+                        }
+                    }
                     for (relocation, count) in &elf_report.relocation_types {
                         println!("    {relocation}: {count}");
                     }

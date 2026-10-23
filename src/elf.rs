@@ -31,6 +31,15 @@ pub struct ElfLoadPlan {
     pub segments: Vec<ElfLoadSegment>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ElfPageProtection {
+    pub start: u64,
+    pub end: u64,
+    pub readable: bool,
+    pub writable: bool,
+    pub executable: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ElfInitPlan {
     pub init: Option<u64>,
@@ -139,6 +148,60 @@ impl ElfReport {
             && self.has_load_segment
             && self.has_dynamic_segment
             && self.load_plan.is_some()
+    }
+}
+
+impl ElfLoadPlan {
+    pub fn page_protection_plan(&self) -> Result<Vec<ElfPageProtection>> {
+        let mut boundaries = vec![self.image_start, self.image_end];
+        for segment in &self.segments {
+            if segment.mapped_start < self.image_start
+                || segment.mapped_end > self.image_end
+                || segment.mapped_start >= segment.mapped_end
+            {
+                anyhow::bail!("intervalo PT_LOAD inválido para plano de proteção por página");
+            }
+            boundaries.push(segment.mapped_start);
+            boundaries.push(segment.mapped_end);
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+
+        let mut ranges: Vec<ElfPageProtection> = Vec::new();
+        for interval in boundaries.windows(2) {
+            let [start, end] = [interval[0], interval[1]];
+            if start == end {
+                continue;
+            }
+            let covering = self
+                .segments
+                .iter()
+                .filter(|segment| segment.mapped_start <= start && segment.mapped_end >= end);
+            let mut protection = ElfPageProtection {
+                start,
+                end,
+                readable: false,
+                writable: false,
+                executable: false,
+            };
+            for segment in covering {
+                protection.readable |= segment.readable;
+                protection.writable |= segment.writable;
+                protection.executable |= segment.executable;
+            }
+
+            if let Some(previous) = ranges.last_mut()
+                && previous.end == start
+                && previous.readable == protection.readable
+                && previous.writable == protection.writable
+                && previous.executable == protection.executable
+            {
+                previous.end = end;
+            } else {
+                ranges.push(protection);
+            }
+        }
+        Ok(ranges)
     }
 }
 
@@ -1398,6 +1461,55 @@ mod tests {
         assert_eq!(
             plan.segments[1].memory_size - plan.segments[1].file_size,
             0x800
+        );
+        assert_eq!(
+            plan.page_protection_plan().unwrap(),
+            vec![
+                ElfPageProtection {
+                    start: 0x1000,
+                    end: 0x2000,
+                    readable: true,
+                    writable: false,
+                    executable: false,
+                },
+                ElfPageProtection {
+                    start: 0x2000,
+                    end: 0x3000,
+                    readable: false,
+                    writable: false,
+                    executable: false,
+                },
+                ElfPageProtection {
+                    start: 0x3000,
+                    end: 0x5000,
+                    readable: true,
+                    writable: true,
+                    executable: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unions_permissions_when_load_segments_share_a_page() {
+        let plan = build_load_plan(
+            0x4000,
+            &[
+                (0x1000, 0x1000, 0x1000, 0x1000, 0x1000, program_header::PF_R),
+                (0x2f00, 0x1f00, 0x100, 0x100, 1, program_header::PF_W),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.page_protection_plan().unwrap(),
+            vec![ElfPageProtection {
+                start: 0x1000,
+                end: 0x2000,
+                readable: true,
+                writable: true,
+                executable: false,
+            }]
         );
     }
 
