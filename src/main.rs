@@ -106,8 +106,8 @@ fn run() -> Result<()> {
     if show_symbols {
         for method in &report.native_methods {
             println!(
-                "  - {}.{} [{}]",
-                method.class_name, method.method_name, method.dex_file
+                "  - {}.{}{} [{}]",
+                method.class_name, method.method_name, method.parameter_descriptor, method.dex_file
             );
         }
     }
@@ -164,8 +164,11 @@ fn run() -> Result<()> {
 
     let jni_links = jni::resolve_native_methods(&report.native_methods, &report.libraries);
     println!(
-        "Associação JNI estática: {} métodos com export Java_* convencional; {} sem correspondência direta",
-        jni_links.conventional_matches, jni_links.without_conventional_match
+        "Associação JNI estática: {} correspondências convencionais ({} por descritor exato); {} ambiguidades de nome curto; {} sem correspondência",
+        jni_links.conventional_matches,
+        jni_links.exact_signature_matches,
+        jni_links.ambiguous_short_names,
+        jni_links.without_conventional_match
     );
     if !jni_links.on_load_libraries.is_empty() {
         println!(
@@ -181,23 +184,28 @@ fn run() -> Result<()> {
     if show_symbols {
         println!("Associações de métodos nativos DEX:");
         for method in &jni_links.methods {
-            if method.matching_exports.is_empty() {
-                println!(
-                    "  - {}.{} [{}]: sem export Java_* correspondente",
-                    method.class_name, method.method_name, method.dex_file
-                );
-            } else {
-                println!(
-                    "  - {}.{} [{}]: {}",
-                    method.class_name,
-                    method.method_name,
-                    method.dex_file,
-                    method.matching_exports.join(", ")
-                );
-            }
+            let resolution = match method.resolution {
+                jni::NativeResolutionKind::ExactSignature => "descritor exato",
+                jni::NativeResolutionKind::ShortName => "nome curto sem sobrecarga DEX",
+                jni::NativeResolutionKind::AmbiguousShortName => "nome curto ambíguo",
+                jni::NativeResolutionKind::Unmatched => "sem correspondência direta",
+            };
+            println!(
+                "  - {}.{}{} [{}]: {}{}",
+                method.class_name,
+                method.method_name,
+                method.parameter_descriptor,
+                method.dex_file,
+                resolution,
+                if method.matching_exports.is_empty() {
+                    String::new()
+                } else {
+                    format!(" -> {}", method.matching_exports.join(", "))
+                }
+            );
         }
         println!(
-            "Nota: a comparação usa classe e nome do método; não resolve sobrecargas por descritor JNI. Métodos sem export Java_* podem ser registrados via JNI_OnLoad, mas isso exige análise adicional."
+            "Nota: descritores exatos vêm do sufixo JNI de overload. Export sem sufixo só é associado automaticamente quando o DEX tem um único método nativo com esse nome. Métodos sem export Java_* podem depender de RegisterNatives, mas isso exige análise adicional."
         );
     }
 

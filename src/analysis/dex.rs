@@ -16,6 +16,7 @@ pub struct DexReport {
 pub struct NativeMethod {
     pub class_name: String,
     pub method_name: String,
+    pub parameter_descriptor: String,
     pub dex_file: String,
 }
 
@@ -29,6 +30,7 @@ pub struct LibraryLoad {
 struct MethodReference {
     class_name: String,
     method_name: String,
+    parameter_descriptor: String,
 }
 
 pub fn parse(bytes: &[u8], dex_file: &str) -> Result<DexReport> {
@@ -44,12 +46,14 @@ pub fn parse(bytes: &[u8], dex_file: &str) -> Result<DexReport> {
 
     let strings = read_strings(bytes, read_u32(bytes, 56)?, read_u32(bytes, 60)?)?;
     let types = read_types(bytes, read_u32(bytes, 64)?, read_u32(bytes, 68)?, &strings)?;
+    let prototypes = read_prototypes(bytes, read_u32(bytes, 72)?, read_u32(bytes, 76)?, &types)?;
     let methods = read_methods(
         bytes,
         read_u32(bytes, 88)?,
         read_u32(bytes, 92)?,
         &types,
         &strings,
+        &prototypes,
     )?;
     let class_defs_size = read_u32(bytes, 96)? as usize;
     let class_defs_offset = read_u32(bytes, 100)? as usize;
@@ -90,7 +94,10 @@ pub fn parse(bytes: &[u8], dex_file: &str) -> Result<DexReport> {
                 let method = methods
                     .get(method_index as usize)
                     .context("índice de método DEX inválido")?;
-                let caller = format!("{}->{}", class_name, method.method_name);
+                let caller = format!(
+                    "{}->{}{}",
+                    class_name, method.method_name, method.parameter_descriptor
+                );
 
                 if access_flags & ACC_NATIVE != 0 {
                     native_methods.push(NativeMethod {
@@ -100,6 +107,7 @@ pub fn parse(bytes: &[u8], dex_file: &str) -> Result<DexReport> {
                             .trim_end_matches(';')
                             .to_owned(),
                         method_name: method.method_name.clone(),
+                        parameter_descriptor: method.parameter_descriptor.clone(),
                         dex_file: dex_file.to_owned(),
                     });
                 }
@@ -176,6 +184,7 @@ fn scan_code(
             method_calls.push(MethodReference {
                 class_name: method.class_name.clone(),
                 method_name: method.method_name.clone(),
+                parameter_descriptor: method.parameter_descriptor.clone(),
             });
         } else if opcode == 0xfa || opcode == 0xfb {
             let method_index = *units
@@ -188,6 +197,7 @@ fn scan_code(
             method_calls.push(MethodReference {
                 class_name: method.class_name.clone(),
                 method_name: method.method_name.clone(),
+                parameter_descriptor: method.parameter_descriptor.clone(),
             });
         } else if opcode == 0x1a || opcode == 0x1b {
             let string_index = if opcode == 0x1a {
@@ -349,6 +359,7 @@ fn read_methods(
     offset: u32,
     types: &[String],
     strings: &[String],
+    prototypes: &[String],
 ) -> Result<Vec<MethodReference>> {
     let count = count as usize;
     check_table_count(count)?;
@@ -358,7 +369,7 @@ fn read_methods(
     for index in 0..count {
         let method_offset = offset + index * 8;
         let class_index = read_u16(bytes, method_offset)? as usize;
-        let _proto_index = read_u16(bytes, method_offset + 2)?;
+        let proto_index = read_u16(bytes, method_offset + 2)? as usize;
         let name_index = read_u32(bytes, method_offset + 4)? as usize;
         let class_name = types
             .get(class_index)
@@ -366,12 +377,56 @@ fn read_methods(
         let method_name = strings
             .get(name_index)
             .context("nome de método DEX inválido")?;
+        let prototype = prototypes
+            .get(proto_index)
+            .context("índice de protótipo de método DEX inválido")?;
+        let parameter_descriptor = prototype
+            .split_once(')')
+            .context("descritor de protótipo DEX inválido")?
+            .0
+            .to_owned()
+            + ")";
         methods.push(MethodReference {
             class_name: class_name.clone(),
             method_name: method_name.clone(),
+            parameter_descriptor,
         });
     }
     Ok(methods)
+}
+
+fn read_prototypes(bytes: &[u8], count: u32, offset: u32, types: &[String]) -> Result<Vec<String>> {
+    let count = count as usize;
+    check_table_count(count)?;
+    let offset = offset as usize;
+    checked_range(bytes, offset, count, 12)?;
+    let mut prototypes = Vec::with_capacity(count);
+    for index in 0..count {
+        let prototype_offset = offset + index * 12;
+        let return_type_index = read_u32(bytes, prototype_offset + 4)? as usize;
+        let parameters_offset = read_u32(bytes, prototype_offset + 8)? as usize;
+        let return_type = types
+            .get(return_type_index)
+            .context("índice de tipo de retorno DEX inválido")?;
+        let mut descriptor = String::from("(");
+        if parameters_offset != 0 {
+            let size = read_u32(bytes, parameters_offset)? as usize;
+            check_table_count(size)?;
+            checked_range(bytes, parameters_offset + 4, size, 2)?;
+            for parameter in 0..size {
+                let type_index = read_u16(bytes, parameters_offset + 4 + parameter * 2)? as usize;
+                descriptor.push_str(
+                    types
+                        .get(type_index)
+                        .context("índice de tipo de parâmetro DEX inválido")?,
+                );
+            }
+        }
+        descriptor.push(')');
+        descriptor.push_str(return_type);
+        prototypes.push(descriptor);
+    }
+    Ok(prototypes)
 }
 
 fn skip_encoded_fields(bytes: &[u8], cursor: &mut usize, count: u32) -> Result<()> {
@@ -464,5 +519,28 @@ mod tests {
         assert_eq!(instruction_size(&units, 4).unwrap(), 4);
         assert_eq!(instruction_size(&units, 5).unwrap(), 1);
         assert_eq!(instruction_size(&units, 6).unwrap(), 6);
+    }
+
+    #[test]
+    fn reads_parameter_and_return_types_from_dex_prototypes() {
+        let mut bytes = [0_u8; 20];
+        bytes[4..8].copy_from_slice(&2_u32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&12_u32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&2_u32.to_le_bytes());
+        bytes[16..18].copy_from_slice(&0_u16.to_le_bytes());
+        bytes[18..20].copy_from_slice(&1_u16.to_le_bytes());
+
+        let prototypes = read_prototypes(
+            &bytes,
+            1,
+            0,
+            &[
+                "I".to_owned(),
+                "Ljava/lang/String;".to_owned(),
+                "V".to_owned(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(prototypes, ["(ILjava/lang/String;)V"]);
     }
 }
