@@ -3,6 +3,8 @@ use std::{collections::BTreeMap, env, ffi::OsStr, path::Path, process::ExitCode}
 use anyhow::{Result, bail};
 use apk_inspector::{apk, jni};
 
+const PRIORITIZED_FRAMEWORK_CALLS: usize = 20;
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -136,6 +138,13 @@ fn run() -> Result<()> {
     println!("Namespaces de API mais referenciados:");
     for (namespace, count) in api_namespaces.iter().take(15) {
         println!("  - {namespace}: {count} classes");
+    }
+    println!(
+        "Chamadas Java/Android mais frequentes (até {}):",
+        PRIORITIZED_FRAMEWORK_CALLS
+    );
+    for (method, count) in prioritized_framework_calls(&report.framework_calls) {
+        println!("  - {method} ({count} call sites)");
     }
     println!(
         "Chamadas a carregadores de bibliotecas detectadas: {}",
@@ -300,4 +309,54 @@ fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn prioritized_framework_calls(calls: &BTreeMap<String, usize>) -> Vec<(&str, usize)> {
+    let mut prioritized = calls
+        .iter()
+        .map(|(method, count)| (method.as_str(), *count))
+        .collect::<Vec<_>>();
+    prioritized.sort_by(|(left_method, left_count), (right_method, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_method.cmp(right_method))
+    });
+    prioritized.truncate(PRIORITIZED_FRAMEWORK_CALLS);
+    prioritized
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prioritizes_framework_calls_by_frequency_with_stable_ties() {
+        let calls = BTreeMap::from([
+            ("Landroid/view/View;->draw".to_owned(), 8),
+            ("Landroid/content/Context;->getSystemService".to_owned(), 12),
+            ("Landroid/view/View;->invalidate".to_owned(), 8),
+        ]);
+
+        assert_eq!(
+            prioritized_framework_calls(&calls),
+            vec![
+                ("Landroid/content/Context;->getSystemService", 12),
+                ("Landroid/view/View;->draw", 8),
+                ("Landroid/view/View;->invalidate", 8),
+            ]
+        );
+    }
+
+    #[test]
+    fn limits_prioritized_framework_calls_to_twenty() {
+        let calls = (0..25)
+            .map(|index| (format!("Landroid/test/Api{index:02};->call"), index))
+            .collect::<BTreeMap<_, _>>();
+
+        let prioritized = prioritized_framework_calls(&calls);
+
+        assert_eq!(prioritized.len(), PRIORITIZED_FRAMEWORK_CALLS);
+        assert_eq!(prioritized[0].1, 24);
+        assert_eq!(prioritized[19].1, 5);
+    }
 }
