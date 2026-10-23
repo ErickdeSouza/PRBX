@@ -281,7 +281,11 @@ mod tests {
             elf: Ok(ElfReport {
                 class: "ELF64",
                 machine: "AArch64",
+                object_type: "ET_DYN",
+                little_endian: true,
                 abi_matches: true,
+                has_load_segment: true,
+                has_dynamic_segment: true,
                 needed: Vec::new(),
                 imports: Vec::new(),
                 exports: exports.iter().map(|name| (*name).to_owned()).collect(),

@@ -272,10 +272,28 @@ fn run() -> Result<()> {
 
         match &library.elf {
             Ok(elf_report) => {
-                println!("  ELF: {} / {}", elf_report.class, elf_report.machine);
+                println!(
+                    "  ELF: {} / {} / {} / {} endian",
+                    elf_report.class,
+                    elf_report.machine,
+                    elf_report.object_type,
+                    if elf_report.little_endian {
+                        "little"
+                    } else {
+                        "big"
+                    }
+                );
                 if !elf_report.abi_matches {
                     println!("  AVISO: arquitetura ELF não corresponde à pasta ABI");
                 }
+                println!(
+                    "  Pré-validação para carregador ARM64: {}",
+                    if elf_report.is_loadable_android_arm64_shared_object() {
+                        "compatível (não executado)"
+                    } else {
+                        "incompatível"
+                    }
+                );
                 if elf_report.needed.is_empty() {
                     println!("  NEEDED: nenhuma dependência declarada");
                 } else {

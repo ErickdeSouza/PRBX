@@ -1,20 +1,51 @@
 use anyhow::{Context, Result};
-use goblin::elf::{Elf, header};
+use goblin::elf::{Elf, header, program_header};
 use std::collections::BTreeMap;
 
 pub struct ElfReport {
     pub class: &'static str,
     pub machine: &'static str,
+    pub object_type: &'static str,
+    pub little_endian: bool,
     pub abi_matches: bool,
+    pub has_load_segment: bool,
+    pub has_dynamic_segment: bool,
     pub needed: Vec<String>,
     pub imports: Vec<String>,
     pub exports: Vec<String>,
     pub android_api_imports: BTreeMap<&'static str, usize>,
 }
 
+impl ElfReport {
+    pub fn is_loadable_android_arm64_shared_object(&self) -> bool {
+        self.class == "ELF64"
+            && self.machine == "AArch64"
+            && self.object_type == "ET_DYN"
+            && self.little_endian
+            && self.abi_matches
+            && self.has_load_segment
+            && self.has_dynamic_segment
+    }
+}
+
 pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
     let elf = Elf::parse(bytes).context("arquivo não é um ELF válido")?;
     let machine = machine_name(elf.header.e_machine);
+    let object_type = match elf.header.e_type {
+        header::ET_DYN => "ET_DYN",
+        header::ET_EXEC => "ET_EXEC",
+        header::ET_REL => "ET_REL",
+        _ => "tipo ELF desconhecido",
+    };
+    let little_endian = elf.header.e_ident[header::EI_DATA] == header::ELFDATA2LSB;
+    let has_load_segment = elf
+        .program_headers
+        .iter()
+        .any(|segment| segment.p_type == program_header::PT_LOAD);
+    let has_dynamic_segment = elf
+        .program_headers
+        .iter()
+        .any(|segment| segment.p_type == program_header::PT_DYNAMIC);
     let mut imports = Vec::new();
     let mut exports = Vec::new();
 
@@ -42,7 +73,11 @@ pub fn analyze(bytes: &[u8], abi: &str) -> Result<ElfReport> {
     Ok(ElfReport {
         class: elf_class(elf.header.e_ident[header::EI_CLASS]),
         machine,
+        object_type,
+        little_endian,
         abi_matches: abi_matches_machine(abi, elf.header.e_machine),
+        has_load_segment,
+        has_dynamic_segment,
         needed: elf
             .libraries
             .iter()
@@ -138,6 +173,30 @@ mod tests {
     fn checks_android_abi_against_elf_machine() {
         assert!(abi_matches_machine("arm64-v8a", header::EM_AARCH64));
         assert!(!abi_matches_machine("arm64-v8a", header::EM_X86_64));
+    }
+
+    #[test]
+    fn accepts_only_arm64_dynamic_little_endian_elf_with_load_segments() {
+        let report = ElfReport {
+            class: "ELF64",
+            machine: "AArch64",
+            object_type: "ET_DYN",
+            little_endian: true,
+            abi_matches: true,
+            has_load_segment: true,
+            has_dynamic_segment: true,
+            needed: Vec::new(),
+            imports: Vec::new(),
+            exports: Vec::new(),
+            android_api_imports: BTreeMap::new(),
+        };
+        assert!(report.is_loadable_android_arm64_shared_object());
+
+        let incompatible = ElfReport {
+            object_type: "ET_EXEC",
+            ..report
+        };
+        assert!(!incompatible.is_loadable_android_arm64_shared_object());
     }
 
     #[test]

@@ -143,9 +143,9 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
                 library.path
             )
         })?;
-        if !elf.abi_matches {
+        if !elf.is_loadable_android_arm64_shared_object() {
             bail!(
-                "a arquitetura ELF de {} não corresponde à ABI {TARGET_ABI}",
+                "{} não é uma biblioteca ELF64 AArch64 little-endian ET_DYN com segmentos LOAD e DYNAMIC compatível com {TARGET_ABI}",
                 library.path
             );
         }
@@ -799,7 +799,11 @@ mod tests {
             elf: Ok(ElfReport {
                 class: "ELF64",
                 machine: "AArch64",
+                object_type: "ET_DYN",
+                little_endian: true,
                 abi_matches: true,
+                has_load_segment: true,
+                has_dynamic_segment: true,
                 needed: needed.iter().map(|name| (*name).to_owned()).collect(),
                 imports: Vec::new(),
                 exports: Vec::new(),
