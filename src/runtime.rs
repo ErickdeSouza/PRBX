@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     env,
     fs::{self, File},
     io::{self, Read},
@@ -307,44 +307,13 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
         mapped_images.push((file_name.to_owned(), image));
     }
 
-    let mut packaged_symbols = BTreeMap::new();
-    for (index, library) in target_libraries.iter().enumerate() {
-        let elf = library
-            .elf
-            .as_ref()
-            .map_err(|error| anyhow::anyhow!("{}: {error}", library.path))?;
-        let load_bias = mapped_images[index].1.load_bias;
-        for symbol in &elf.dynamic_symbols {
-            if !symbol.defined || !symbol.visible || !(symbol.global || symbol.weak) {
-                continue;
-            }
-            let address = if symbol.absolute {
-                symbol.value
-            } else {
-                load_bias
-                    .checked_add(symbol.value)
-                    .with_context(|| format!("endereço ELF excedido para {}", symbol.name))?
-            };
-            match packaged_symbols.entry(symbol.name.clone()) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert((address, symbol.weak));
-                }
-                std::collections::btree_map::Entry::Occupied(mut entry)
-                    if entry.get().1 && !symbol.weak =>
-                {
-                    entry.insert((address, false));
-                }
-                std::collections::btree_map::Entry::Occupied(_) => {}
-            }
-        }
-    }
-    let packaged_symbols = packaged_symbols
-        .into_iter()
-        .map(|(name, (address, _))| (name, address))
-        .collect::<BTreeMap<_, _>>();
-
-    let mut image_checks = Vec::with_capacity(mapped_images.len());
-    for (index, (file_name, image)) in mapped_images.iter_mut().enumerate() {
+    let load_order = native_load_order(&target_libraries, launch_config.native_library.as_deref())?;
+    let mut image_checks = vec![format!(
+        "Ordem de dependências empacotadas: {}",
+        load_order.join(" -> ")
+    )];
+    for index in 0..mapped_images.len() {
+        let file_name = mapped_images[index].0.clone();
         let library = target_libraries[index];
         let elf = library
             .elf
@@ -354,8 +323,10 @@ pub fn prepare(apk_path: &Path, data_dir: &Path) -> Result<PreparedApp> {
             .load_plan
             .as_ref()
             .with_context(|| format!("{} não tem plano de imagem ELF", library.path))?;
+        let scoped_symbols = packaged_symbol_scope(index, &target_libraries, &mapped_images)?;
+        let image = &mut mapped_images[index].1;
         image
-            .apply_relocations(plan, &elf.relocations, &packaged_symbols)
+            .apply_relocations(plan, &elf.relocations, &scoped_symbols)
             .with_context(|| format!("falha ao aplicar relocations de {file_name}"))?;
         image_checks.push(format!(
             "{file_name}: {} bytes em mmap RW; {} RELATIVE e {} relocations com símbolos aplicadas; {} relocations pendentes; símbolos/tipos: {}{}",
@@ -597,6 +568,168 @@ Mapeamentos são descartados ao terminar prepare, páginas não executáveis, s�
     }
     fs::write(path, report)
         .with_context(|| format!("não foi possível gravar o relatório {}", path.display()))
+}
+
+fn native_load_order(
+    libraries: &[&crate::apk::NativeLibrary],
+    entry_library: Option<&str>,
+) -> Result<Vec<String>> {
+    fn visit(
+        index: usize,
+        libraries: &[&crate::apk::NativeLibrary],
+        indices: &BTreeMap<String, usize>,
+        visiting: &mut BTreeSet<usize>,
+        loaded: &mut BTreeSet<usize>,
+        order: &mut Vec<String>,
+    ) -> Result<()> {
+        if loaded.contains(&index) || !visiting.insert(index) {
+            return Ok(());
+        }
+        let library = libraries[index];
+        let elf = library
+            .elf
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{}: {error}", library.path))?;
+        for dependency in &elf.needed {
+            if let Some(dependency_index) = indices.get(dependency) {
+                visit(
+                    *dependency_index,
+                    libraries,
+                    indices,
+                    visiting,
+                    loaded,
+                    order,
+                )?;
+            }
+        }
+        visiting.remove(&index);
+        if loaded.insert(index) {
+            order.push(
+                Path::new(&library.path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .with_context(|| format!("caminho ELF inválido: {}", library.path))?
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    let indices = libraries
+        .iter()
+        .enumerate()
+        .map(|(index, library)| {
+            let name = Path::new(&library.path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .with_context(|| format!("caminho ELF inválido: {}", library.path))?;
+            Ok((name.to_owned(), index))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let mut roots = Vec::new();
+    if let Some(entry_library) = entry_library {
+        let name = Path::new(entry_library)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("caminho da biblioteca de entrada inválido")?;
+        let index = indices
+            .get(name)
+            .with_context(|| format!("biblioteca de entrada {name} não está empacotada"))?;
+        roots.push(*index);
+    }
+    roots.extend(0..libraries.len());
+
+    let mut order = Vec::new();
+    let mut visiting = BTreeSet::new();
+    let mut loaded = BTreeSet::new();
+    for root in roots {
+        visit(
+            root,
+            libraries,
+            &indices,
+            &mut visiting,
+            &mut loaded,
+            &mut order,
+        )?;
+    }
+    Ok(order)
+}
+
+fn packaged_symbol_scope(
+    importer_index: usize,
+    libraries: &[&crate::apk::NativeLibrary],
+    images: &[(String, crate::elf::MappedElfImage)],
+) -> Result<BTreeMap<String, u64>> {
+    let indices = libraries
+        .iter()
+        .enumerate()
+        .map(|(index, library)| {
+            let name = Path::new(&library.path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .with_context(|| format!("caminho ELF inválido: {}", library.path))?;
+            Ok((name.to_owned(), index))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let importer = libraries
+        .get(importer_index)
+        .context("índice da biblioteca importadora inválido")?;
+    let importer_elf = importer
+        .elf
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("{}: {error}", importer.path))?;
+    let mut queue = VecDeque::from(importer_elf.needed.clone());
+    let mut visited = BTreeSet::new();
+    let mut symbols = BTreeMap::<String, (u64, bool)>::new();
+
+    while let Some(dependency) = queue.pop_front() {
+        let Some(index) = indices.get(&dependency).copied() else {
+            continue;
+        };
+        if !visited.insert(index) {
+            continue;
+        }
+        let library = libraries[index];
+        let elf = library
+            .elf
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{}: {error}", library.path))?;
+        let load_bias = images
+            .get(index)
+            .context("imagem mapeada ausente para dependência empacotada")?
+            .1
+            .load_bias;
+        for symbol in &elf.dynamic_symbols {
+            if !symbol.defined || !symbol.visible || !(symbol.global || symbol.weak) {
+                continue;
+            }
+            let address = if symbol.absolute {
+                symbol.value
+            } else {
+                load_bias
+                    .checked_add(symbol.value)
+                    .with_context(|| format!("endereço ELF excedido para {}", symbol.name))?
+            };
+            match symbols.entry(symbol.name.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((address, symbol.weak));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry)
+                    if entry.get().1 && !symbol.weak =>
+                {
+                    entry.insert((address, false));
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+        }
+        queue.extend(elf.needed.iter().cloned());
+    }
+
+    let mut scope = BTreeMap::new();
+    for (name, (address, _)) in symbols {
+        scope.insert(name, address);
+    }
+    Ok(scope)
 }
 
 fn native_dependencies(libraries: &[&crate::apk::NativeLibrary]) -> Result<Vec<NativeDependency>> {
@@ -1150,6 +1283,121 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn orders_packaged_libraries_dependencies_first_and_breaks_cycles() {
+        let app = native_library("lib/arm64-v8a/libapp.so", &["libfirst.so", "libsecond.so"]);
+        let first = native_library("lib/arm64-v8a/libfirst.so", &["libtransitive.so"]);
+        let second = native_library("lib/arm64-v8a/libsecond.so", &[]);
+        let transitive = native_library("lib/arm64-v8a/libtransitive.so", &[]);
+        let libraries = [&app, &first, &second, &transitive];
+
+        assert_eq!(
+            native_load_order(&libraries, Some("native/arm64-v8a/libapp.so")).unwrap(),
+            vec![
+                "libtransitive.so",
+                "libfirst.so",
+                "libsecond.so",
+                "libapp.so"
+            ]
+        );
+
+        let cycle_a = native_library("lib/arm64-v8a/libcycle-a.so", &["libcycle-b.so"]);
+        let cycle_b = native_library("lib/arm64-v8a/libcycle-b.so", &["libcycle-a.so"]);
+        assert_eq!(
+            native_load_order(&[&cycle_a, &cycle_b], Some("libcycle-a.so")).unwrap(),
+            vec!["libcycle-b.so", "libcycle-a.so"]
+        );
+    }
+
+    #[test]
+    fn resolves_symbols_only_from_needed_dependency_scope_with_strong_precedence() {
+        let mut libraries = vec![
+            native_library("lib/arm64-v8a/libapp.so", &["libfirst.so", "libsecond.so"]),
+            native_library("lib/arm64-v8a/libfirst.so", &["libtransitive.so"]),
+            native_library("lib/arm64-v8a/libsecond.so", &[]),
+            native_library("lib/arm64-v8a/libtransitive.so", &[]),
+            native_library("lib/arm64-v8a/libunrelated.so", &[]),
+        ];
+
+        libraries[1]
+            .elf
+            .as_mut()
+            .unwrap()
+            .dynamic_symbols
+            .push(crate::elf::ElfDynamicSymbol {
+                name: "shared_symbol".to_owned(),
+                value: 0x20,
+                defined: true,
+                absolute: false,
+                global: false,
+                weak: true,
+                visible: true,
+            });
+        libraries[2]
+            .elf
+            .as_mut()
+            .unwrap()
+            .dynamic_symbols
+            .push(crate::elf::ElfDynamicSymbol {
+                name: "shared_symbol".to_owned(),
+                value: 0x30,
+                defined: true,
+                absolute: false,
+                global: true,
+                weak: false,
+                visible: true,
+            });
+        libraries[3]
+            .elf
+            .as_mut()
+            .unwrap()
+            .dynamic_symbols
+            .push(crate::elf::ElfDynamicSymbol {
+                name: "transitive_symbol".to_owned(),
+                value: 0x40,
+                defined: true,
+                absolute: false,
+                global: true,
+                weak: false,
+                visible: true,
+            });
+        libraries[4]
+            .elf
+            .as_mut()
+            .unwrap()
+            .dynamic_symbols
+            .push(crate::elf::ElfDynamicSymbol {
+                name: "unrelated_symbol".to_owned(),
+                value: 0x50,
+                defined: true,
+                absolute: false,
+                global: true,
+                weak: false,
+                visible: true,
+            });
+
+        let library_refs = libraries.iter().collect::<Vec<_>>();
+        let images = library_refs
+            .iter()
+            .map(|library| {
+                let name = Path::new(&library.path)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
+                let plan = library.elf.as_ref().unwrap().load_plan.as_ref().unwrap();
+                let image = crate::elf::map_load_image(&[], plan, 4096).unwrap();
+                (name, image)
+            })
+            .collect::<Vec<_>>();
+        let scope = packaged_symbol_scope(0, &library_refs, &images).unwrap();
+
+        assert_eq!(scope["shared_symbol"], images[2].1.load_bias + 0x30);
+        assert_eq!(scope["transitive_symbol"], images[3].1.load_bias + 0x40);
+        assert!(!scope.contains_key("unrelated_symbol"));
     }
 
     #[test]
